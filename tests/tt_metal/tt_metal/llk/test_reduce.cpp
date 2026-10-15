@@ -1186,6 +1186,9 @@ TEST_F(LLKQuasarMeshDeviceSingleCardFixture, DISABLED_TensixComputeReduceColumnM
 // restores both unpackers and the ALU. Mirrors the LLK test_reduce_quasar_mxfp4_2x_gapool python test at
 // the metal layer, which drives the LLK directly and so does not exercise the llk_api init/uninit.
 TEST_F(LLKQuasarMeshDeviceSingleCardFixture, TensixComputeReduceColumnMxFp4X2) {
+    if (MetalContext::instance().rtoptions().get_quasar_variant() == "trinity") {
+        GTEST_SKIP() << "MxFp4_2x register formats do not exist on Trinity";
+    }
     run_single_core_reduce_h_mxfp4_2x_then_add(this->device());
 }
 
