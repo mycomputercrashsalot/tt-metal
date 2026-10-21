@@ -300,11 +300,11 @@ private:
     // Non-blocking write. Returns false immediately if the FIFO can't fit `num_pages`
     // without spinning. Accessible only via tt::tt_metal::experimental::detail::try_write.
     bool try_write_impl(void* data, uint32_t num_pages);
-    // Writes as many of the `max_pages` consecutive pages at `data` as the FIFO has room for, without
-    // store fences or a receiver notification, and returns how many it wrote. They are counted as sent
-    // and reach the receiver once a store fence and notify_receiver_unfenced follow. Accessible only via
-    // tt::tt_metal::experimental::detail::try_stage / publish_staged.
-    uint32_t try_stage_impl(const void* data, uint32_t max_pages);
+    // Writes as many of the `num_pages` pages at `pages` (one pointer per page, each page_size_ bytes) as the
+    // FIFO has room for, in order, without store fences or a receiver notification, and returns how many it
+    // wrote. Only the pages it writes are read. They are counted as sent and reach the receiver only through
+    // publish_staged. Accessible only via tt::tt_metal::experimental::detail::try_stage / publish_staged.
+    uint32_t try_stage_impl(const uint8_t* const* pages, uint32_t num_pages);
 
     friend struct tt::tt_metal::experimental::detail::H2DSocketTryWriteAccess;
     friend struct tt::tt_metal::experimental::detail::H2DSocketDramRecvAccess;
@@ -328,6 +328,8 @@ private:
     std::unique_ptr<tt::umd::IoWindow> receiver_core_window_;
     std::shared_ptr<tt::tt_metal::experimental::PinnedMemory> pinned_memory_ = nullptr;
     std::shared_ptr<uint32_t[]> host_buffer_ = nullptr;
+    // HOST_PUSH only: try_stage_impl gathers a run of pages here so that the run goes out in one write.
+    std::vector<uint8_t> stage_buffer_;
     uint32_t* bytes_acked_ptr_ = nullptr;
     std::function<void(void*, uint32_t, uint64_t)> pcie_writer = nullptr;
     H2DMode h2d_mode_ = H2DMode::HOST_PUSH;
