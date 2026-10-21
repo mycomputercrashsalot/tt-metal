@@ -55,9 +55,10 @@ _UNIT_CASE = _ProductionCase(
 
 # Kimi-K3 production layouts. References are medians of the CI bh_p150b_civ2_viommu runner (four main nightlies,
 # plus one PR run for sp1-tp8 and sp2-tp4); the earlier development-machine references sat at the top of the
-# runner's spread, so sp2-tp4 fell below its band on an ordinary run (72,849 ns).
+# runner's spread, so sp2-tp4 fell below its band on an ordinary run (72,849 ns). sp1-tp8 is the median of 21 main
+# nightlies (2026-09-30 to 10-21): its runs spread 94,339-101,521 ns, and the earlier reference clipped the low ones.
 _PRODUCTION_CASES = (
-    _ProductionCase("sp1-tp8", 12, 8, 128, 128, 99597),
+    _ProductionCase("sp1-tp8", 12, 8, 128, 128, 99061),
     _ProductionCase("sp2-tp4", 24, 4, 128, 128, 74808),
     _ProductionCase("sp4-tp2", 48, 2, 128, 128, 65831),
 )

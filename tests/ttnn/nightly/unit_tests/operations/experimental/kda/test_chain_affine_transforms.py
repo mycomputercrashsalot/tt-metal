@@ -42,7 +42,8 @@ _STEPS = 1
 _PRODUCTION_PERF_MARGIN = 0.05
 _SMALL_CASE = _Case("bh2-k32-v64", batch_heads=2, key_dim=32, value_dim=64)
 _PRODUCTION_PERF_CASE = _Case("p1-bh24-k128-v128", batch_heads=24, key_dim=128, value_dim=128)
-_PRODUCTION_PERF_EXPECTED_DURATION_NS = 26_700
+# Median of the bh_p150b_civ2_viommu main nightlies since the 2026-10-17 speedup (25,041-25,958 ns).
+_PRODUCTION_PERF_EXPECTED_DURATION_NS = 25_700
 
 
 def _chain_affine_transforms_ops(
