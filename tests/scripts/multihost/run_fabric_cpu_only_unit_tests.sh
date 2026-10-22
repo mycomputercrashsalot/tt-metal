@@ -80,12 +80,14 @@ if [[ -z "${OMPI_MCA_mpi_yield_when_idle:-}" ]]; then
   export OMPI_MCA_mpi_yield_when_idle=1
 fi
 
-# The fabric-tests workflow exports TT_METAL_OPERATION_TIMEOUT_SECONDS=20 for the hardware jobs' hang
-# detection, and peers inherit it as the topology mapper's wait for rank 0's chip-info broadcast. On
-# these oversubscribed mock runs a healthy rank 0 of a 16-64 rank group can legitimately take longer
-# than that on a small runner, so peers falsely declare the controller dead. Floor it for CPU-only
-# runs; commands that need even longer still set their own value.
-if (( ${TT_METAL_OPERATION_TIMEOUT_SECONDS:-0} < 300 )); then
+# The fabric-tests workflow exports a small TT_METAL_OPERATION_TIMEOUT_SECONDS (e.g. 5.0) for the
+# hardware jobs' hang detection, and peers inherit it as the topology mapper's wait for rank 0's
+# chip-info broadcast. On these oversubscribed mock runs a healthy rank 0 of a 16-64 rank group can
+# legitimately take longer than that on a small runner, so peers falsely declare the controller dead.
+# Floor it to 300s for CPU-only runs; commands that need even longer still set their own value.
+# printf rounds to an integer first because bash (( )) cannot compare the float the workflow passes.
+current_timeout=$(printf '%.0f' "${TT_METAL_OPERATION_TIMEOUT_SECONDS:-0}")
+if (( current_timeout < 300 )); then
   export TT_METAL_OPERATION_TIMEOUT_SECONDS=300
 fi
 
