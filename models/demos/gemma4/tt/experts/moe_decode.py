@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 """Decode-frame routed experts on the decode MoE kernel (all_to_all_dispatch_metadata -> moe_compute -> fused
-score-weighted reduce -> reduce-scatter), models/common/modules/moe/TTMoEDecode with the gemma_4_26b config.
+score-weighted reduce -> reduce-scatter), models/common/moe/TTMoEDecode with the gemma_4_26b config.
 
 Layout: the frame's rows (all lanes, gathered on every chip) are split over the mesh rows (the dispatch axis,
 cluster_axis 0); every column holds 32 experts (4 per chip on the Galaxy, 16 on a (2,4) block), the same placement
@@ -18,10 +18,19 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.common.modules.moe.tt_moe_decode import TTMoEDecode
-from models.common.modules.moe.tt_moe_decode_config import TTMoEDecodeConfig
 
-CONFIG_YAML = Path(__file__).resolve().parents[4] / "common" / "modules" / "moe" / "configs" / "gemma_4_26b.yaml"
+try:  # main moved the shared decode MoE library to models/common/moe (TTTv2 left tt-metal)
+    from models.common.moe.tt_moe_decode import TTMoEDecode
+    from models.common.moe.tt_moe_decode_config import TTMoEDecodeConfig
+
+    _MOE_LIB_DIR = Path(__file__).resolve().parents[4] / "common" / "moe"
+except ImportError:  # builds before that move keep the old package
+    from models.common.modules.moe.tt_moe_decode import TTMoEDecode
+    from models.common.modules.moe.tt_moe_decode_config import TTMoEDecodeConfig
+
+    _MOE_LIB_DIR = Path(__file__).resolve().parents[4] / "common" / "modules" / "moe"
+
+CONFIG_YAML = _MOE_LIB_DIR / "configs" / "gemma_4_26b.yaml"
 
 
 def moe_decode_kernel_enabled():
