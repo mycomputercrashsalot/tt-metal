@@ -47,8 +47,10 @@ def _weights(emb_dim, hidden_dim):
     }
 
 
-def run_routed_expert(mesh_device, num_tokens, emb_dim, hidden_dim, activation):
-    """1 chip, 1 expert: the fused op with the selected activation vs the torch reference."""
+def run_routed_expert(mesh_device, num_tokens, emb_dim, hidden_dim, activation, hybrid_token_threshold=None):
+    """1 chip, 1 expert: the fused op with the selected activation vs the torch reference. With a
+    ``hybrid_token_threshold`` at or above ``num_tokens`` the expert runs on ``moe_fused_swiglu`` alone
+    (the DRAM-bound band of the hybrid split)."""
     weights = _weights(emb_dim, hidden_dim)
     torch.manual_seed(7)
     torch_input = torch.randn(num_tokens, emb_dim, dtype=torch.float32)
@@ -72,6 +74,7 @@ def run_routed_expert(mesh_device, num_tokens, emb_dim, hidden_dim, activation):
         activations_dtype=ttnn.bfloat8_b,
         weights_dtype=ttnn.bfloat4_b,
         activation=activation,
+        hybrid_token_threshold=hybrid_token_threshold,
     )
     inp = ttnn.from_torch(
         torch_input,
@@ -119,3 +122,66 @@ def test_gelu_tanh_differs_from_silu(mesh_device, device_params):
 
 def test_routed_expert_activation_enum_exposed():
     assert hasattr(ttnn.RoutedExpertActivation, "GeluTanhGlu")
+
+
+@pytest.mark.skipif(not is_blackhole(), reason="moe_fused_swiglu is Blackhole-only")
+@pytest.mark.parametrize("num_tokens", [64, 128], ids=["t64", "t128"])
+@pytest.mark.parametrize("mesh_device, device_params", SINGLE_CHIP_MESH_PARAMS, indirect=True)
+def test_gelu_tanh_fused_band(mesh_device, device_params, num_tokens):
+    """GeGLU on ``moe_fused_swiglu`` (the <= T band of the hybrid split): a threshold at num_tokens sends
+    the whole expert to the fused op; the packer-thread gelu_tanh must match the torch reference."""
+    run_routed_expert(
+        mesh_device, num_tokens, 256, 512, ttnn.RoutedExpertActivation.GeluTanhGlu, hybrid_token_threshold=num_tokens
+    )
+
+
+@pytest.mark.skipif(not is_blackhole(), reason="hybrid_routed_expert_moe is Blackhole-only")
+@pytest.mark.parametrize("mesh_device, device_params", SINGLE_CHIP_MESH_PARAMS, indirect=True)
+def test_gelu_tanh_hybrid_split(mesh_device, device_params):
+    """Two experts on one chip, one above and one below the threshold, so the composite (GeGLU on the
+    MATH SFPU) and the fused op (GeGLU on the packer) each own one band in a single forward."""
+    emb_dim, hidden_dim, max_tokens, threshold = 256, 512, 256, 96
+    counts = [max_tokens, 64]  # expert 0 -> unified band, expert 1 -> fused band
+    torch.manual_seed(3)
+    weights = [_weights(emb_dim, hidden_dim), _weights(emb_dim, hidden_dim)]
+    weights[1] = {k: v * 1.1 for k, v in weights[1].items()}  # distinct experts
+    inputs = [torch.randn(c, emb_dim, dtype=torch.float32) for c in counts]
+    with torch.no_grad():
+        refs = [_torch_geglu_expert(x, w) for x, w in zip(inputs, weights)]
+
+    def _idx(values):
+        return ttnn.from_torch(
+            torch.tensor(values, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh_device, dtype=ttnn.uint32
+        )
+
+    tt_expert = TtRoutedExpert(
+        mesh_device=mesh_device,
+        experts_per_chip=2,
+        global_expert_idx_table=_idx([0, 1]),
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        max_tokens=max_tokens,
+        torch_weights=weights,
+        activations_dtype=ttnn.bfloat8_b,
+        weights_dtype=ttnn.bfloat4_b,
+        activation=ttnn.RoutedExpertActivation.GeluTanhGlu,
+        hybrid_token_threshold=threshold,
+    )
+    buf = torch.zeros(2 * max_tokens, emb_dim, dtype=torch.float32)
+    buf[: counts[0]] = inputs[0]
+    buf[max_tokens : max_tokens + counts[1]] = inputs[1]
+    inp = ttnn.from_torch(
+        buf,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+        layout=ttnn.TILE_LAYOUT,
+        device=mesh_device,
+        dtype=ttnn.bfloat8_b,
+    )
+    out = tt_expert(inp, _idx(counts), _idx([0, max_tokens]))
+    out_t = ttnn.to_torch(out, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0))
+    for e, (c, ref) in enumerate(zip(counts, refs)):
+        got = out_t[e * max_tokens : e * max_tokens + c]
+        passing, pcc = comp_pcc(ref, got, 0.97)
+        logger.info(f"hybrid GeGLU expert {e} ({'fused' if c <= threshold else 'unified'} band, {c} tokens): PCC={pcc}")
+        assert not torch.isnan(got).any() and not torch.isinf(got).any(), f"expert {e}: non-finite output"
+        assert passing, f"expert {e}: PCC {pcc} below threshold"

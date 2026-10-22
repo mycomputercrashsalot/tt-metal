@@ -674,6 +674,9 @@ void append_to_descriptor(
         compute_descriptor.defines.emplace_back("SITU_GLU", "1");
     } else if (operation_arguments.activation == RoutedExpertActivation::SwiGluOai) {
         compute_descriptor.defines.emplace_back("SWIGLU_OAI", "1");
+    } else if (operation_arguments.activation == RoutedExpertActivation::GeluTanhGlu) {
+        // GeGLU (Gemma 4): gelu_tanh(gate) * up on the SiLU code path with the SFPU op swapped.
+        compute_descriptor.defines.emplace_back("GELU_TANH_GLU", "1");
     }
 
     for (uint32_t y = 0; y < kgroups; ++y) {
@@ -967,9 +970,11 @@ void validate(const OperationArguments& operation_arguments, const TensorArgumen
     TT_FATAL(
         operation_arguments.activation == RoutedExpertActivation::Silu ||
             operation_arguments.activation == RoutedExpertActivation::SituGlu ||
-            operation_arguments.activation == RoutedExpertActivation::SwiGluOai,
+            operation_arguments.activation == RoutedExpertActivation::SwiGluOai ||
+            operation_arguments.activation == RoutedExpertActivation::GeluTanhGlu,
         "moe_fused_swiglu: activation must be RoutedExpertActivation::Silu, "
-        "RoutedExpertActivation::SituGlu or RoutedExpertActivation::SwiGluOai");
+        "RoutedExpertActivation::SituGlu, RoutedExpertActivation::SwiGluOai or "
+        "RoutedExpertActivation::GeluTanhGlu");
     // All three or none: biasing some projections and not others is wrong numbers with no error.
     const auto& gate_biases = tensor_arguments.gate_biases;
     const auto& up_biases = tensor_arguments.up_biases;
@@ -2268,6 +2273,9 @@ void append_to_descriptor(
     } else if (op.activation == RoutedExpertActivation::SituGlu) {
         // SiTU-GLU (Kimi K3), with beta_gate=4.0 / beta_up=25.0 baked into the kernel.
         compute_defines["SITU_GLU"] = "1";
+    } else if (op.activation == RoutedExpertActivation::GeluTanhGlu) {
+        // GeGLU (Gemma 4): the unary (SiLU-shaped) path with gelu_tanh on the packer thread.
+        compute_defines["GELU_TANH_GLU"] = "1";
     } else if (op.activation == RoutedExpertActivation::ClampedSiluGlu) {
         // Clamped SiLU-GLU (DeepSeek V4), with limit=10.0 (ClampedSiluGluConfigDsV4) baked
         // into the kernel.

@@ -226,9 +226,11 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(
         operation_arguments.activation == RoutedExpertActivation::Silu ||
             operation_arguments.activation == RoutedExpertActivation::SituGlu ||
-            operation_arguments.activation == RoutedExpertActivation::SwiGluOai,
+            operation_arguments.activation == RoutedExpertActivation::SwiGluOai ||
+            operation_arguments.activation == RoutedExpertActivation::GeluTanhGlu,
         "moe_fused_swiglu: activation must be RoutedExpertActivation::Silu, "
-        "RoutedExpertActivation::SituGlu or RoutedExpertActivation::SwiGluOai");
+        "RoutedExpertActivation::SituGlu, RoutedExpertActivation::SwiGluOai or "
+        "RoutedExpertActivation::GeluTanhGlu");
     // All three or none: biasing some projections and not others is wrong numbers with no error.
     const auto& gate_biases = tensor_arguments.gate_biases;
     const auto& up_biases = tensor_arguments.up_biases;
@@ -252,9 +254,10 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
         // SiLU's kernel path has no bias branch: it applies the activation on the packer thread of
         // the gate reduce, where there is no spare pass to add a bias into.
         TT_FATAL(
-            operation_arguments.activation != RoutedExpertActivation::Silu,
+            operation_arguments.activation != RoutedExpertActivation::Silu &&
+                operation_arguments.activation != RoutedExpertActivation::GeluTanhGlu,
             "moe_fused_swiglu: expert biases require RoutedExpertActivation::SituGlu or "
-            "RoutedExpertActivation::SwiGluOai; the SiLU path has no bias branch");
+            "RoutedExpertActivation::SwiGluOai; the SiLU and GeGLU paths have no bias branch");
         // The CB layout reuses the bf16 tile for all three bias CBs rather than threading a bias
         // format through it, so the tensors have to actually be bf16.
         for (const auto& bias : {std::cref(gate_biases), std::cref(up_biases), std::cref(down_biases)}) {

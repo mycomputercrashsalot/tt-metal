@@ -4,6 +4,10 @@
 #pragma once
 
 #include "api/compute/eltwise_binary.h"
+#ifdef GELU_TANH_GLU
+// GeGLU (Gemma 4): the gate activation on the packer thread is gelu_tanh instead of silu.
+#include "api/compute/eltwise_unary/gelu.h"
+#endif
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
@@ -199,7 +203,11 @@ ALWI void add_silu_elementwise(
         p_stall::STALL_TDMA | p_stall::STALL_CFG, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_ZERO));
     PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
     for (uint32_t tile = 0; tile < tiles; ++tile) {
+#ifdef GELU_TANH_GLU
+        gelu_tanh_tile_pack(tile);
+#else
         silu_tile_pack(tile);
+#endif
     }
     PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
     for (uint32_t tile = 0; tile < tiles; ++tile) {

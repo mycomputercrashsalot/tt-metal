@@ -64,6 +64,7 @@ _FUSED_OP_ACTIVATIONS = (
     ttnn.RoutedExpertActivation.Silu,
     ttnn.RoutedExpertActivation.SituGlu,
     ttnn.RoutedExpertActivation.SwiGluOai,
+    ttnn.RoutedExpertActivation.GeluTanhGlu,
 )
 
 COMPUTE_KERNEL_CONFIG_LOFI = ttnn.WormholeComputeKernelConfig(
