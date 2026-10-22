@@ -9,6 +9,7 @@ from models.demos.gemma4.tt.mm_attention_mask import (
     mm_allowed_matrix,
     vision_block_ids,
     vision_block_spans,
+    vision_placeholder_ids,
 )
 
 IMG, VID, AUD, TXT = 1000, 1001, 1002, 7
@@ -90,3 +91,16 @@ def test_block_spans_key():
     ids = _prompt([(TXT, 2), (IMG, 3), (TXT, 1), (IMG, 2), (TXT, 1)])
     assert vision_block_spans(vision_block_ids(ids, IMG)) == ((2, 5), (6, 8))
     assert vision_block_spans(vision_block_ids(_prompt([(TXT, 4)]), IMG)) == ()
+
+
+def test_placeholder_ids_cover_video_blocks():
+    """The generator must pass BOTH placeholder ids: with the image id alone a video-only prefill stays causal."""
+    assert vision_placeholder_ids(IMG) == [IMG]
+    assert vision_placeholder_ids(IMG, None) == [IMG]
+    assert vision_placeholder_ids(IMG, VID) == [IMG, VID]
+    assert vision_placeholder_ids(IMG, IMG) == [IMG]
+    ids = _prompt([(TXT, 3), (VID, 5), (TXT, 2)])
+    assert int(vision_block_ids(ids, vision_placeholder_ids(IMG)).max()) < 0  # the bug: video block lost
+    blocks = vision_block_ids(ids, vision_placeholder_ids(IMG, VID))
+    assert blocks.tolist() == [-1, -1, -1, 0, 0, 0, 0, 0, -1, -1]
+    assert build_mm_prefill_masks(blocks, 16, sliding_window=4) is not None

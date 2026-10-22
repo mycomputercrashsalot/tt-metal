@@ -1439,9 +1439,11 @@ class ChunkedPrefillPageTableGuardMixin:
         # Image-span bidirectional attention (HF ``use_bidirectional_attention="vision"``): block ids of the
         # prompt's vision placeholders; the model turns them into masks for a whole-prompt single-chunk prefill.
         if base == 0 and getattr(self, "image_token_id", None) is not None:
-            from models.demos.gemma4.tt.mm_attention_mask import vision_block_ids
+            from models.demos.gemma4.tt.mm_attention_mask import vision_block_ids, vision_placeholder_ids
 
-            model._g4_mm_prefill_blocks = vision_block_ids(tokens.reshape(-1), self.image_token_id)
+            model._g4_mm_prefill_blocks = vision_block_ids(
+                tokens.reshape(-1), vision_placeholder_ids(self.image_token_id, getattr(self, "video_token_id", None))
+            )
         try:
             return self.prefill_forward_single_user_text(
                 tokens, page_table, kv_cache=kv_cache, num_cached_tokens=num_cached_tokens, **kwargs
@@ -2159,7 +2161,16 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
         "resumed_prefill_token_alignment": SDPA_CHUNK_ALIGN,
     }
 
-    def __init__(self, *args, vision_tower=None, embed_vision=None, image_token_id=None, pad_token_id=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        vision_tower=None,
+        embed_vision=None,
+        image_token_id=None,
+        pad_token_id=None,
+        video_token_id=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         # Gemma4 decode already returns sampled tokens when on-device sampling is enabled.
         self.enable_split_sampling = False
@@ -2168,6 +2179,8 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
         self.vision_tower = vision_tower
         self.embed_vision = embed_vision
         self.image_token_id = image_token_id
+        # Video soft tokens carry their own placeholder id; both ids form bidirectional vision blocks.
+        self.video_token_id = video_token_id
         self.pad_token_id = pad_token_id
         # The SigLIP path needs tower + projector; the unified (encoder-free)
         # embedder projects straight to text space and carries no projector.
@@ -2513,12 +2526,14 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
         vision_tower = None
         embed_vision = None
         image_token_id = None
+        video_token_id = None
         pad_token_id = None
         if multimodal:
             hf_config = Gemma4ModelArgs.load_hf_config(model_path)
             image_token_id = getattr(hf_config, "image_token_id", None)
             if image_token_id is None:
                 raise ValueError("HF config has no image_token_id — not a multimodal Gemma-4 checkpoint?")
+            video_token_id = getattr(hf_config, "video_token_id", None)
             pad_token_id = getattr(getattr(hf_config, "text_config", hf_config), "pad_token_id", tokenizer.pad_token_id)
 
             # VisionModelArgs reads HF_MODEL env for the checkpoint path (like ModelArgs).
@@ -2574,6 +2589,7 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
             embed_vision=embed_vision,
             image_token_id=image_token_id,
             pad_token_id=pad_token_id,
+            video_token_id=video_token_id,
         )
         return generator, [tt_kv_cache], tokenizer
 
@@ -2817,9 +2833,11 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
         get_last_token = (last_token_idx // 32) * 32
         _llm_t0 = time.perf_counter()
         # Image-span bidirectional attention masks for this whole-prompt prefill (GEMMA4_MM_BIDIR_MASK=1).
-        from models.demos.gemma4.tt.mm_attention_mask import vision_block_ids
+        from models.demos.gemma4.tt.mm_attention_mask import vision_block_ids, vision_placeholder_ids
 
-        model._g4_mm_prefill_blocks = vision_block_ids(input_ids, self.image_token_id)
+        model._g4_mm_prefill_blocks = vision_block_ids(
+            input_ids, vision_placeholder_ids(self.image_token_id, getattr(self, "video_token_id", None))
+        )
         try:
             logits_tt = model.ttnn_prefill_forward(
                 x=merged_tt,

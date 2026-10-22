@@ -21,6 +21,15 @@ import torch
 MASK_NEG = -1e9
 
 
+def vision_placeholder_ids(image_token_id, video_token_id=None) -> list:
+    """The placeholder ids that form bidirectional vision blocks: the image id plus the video id when the
+    checkpoint has one. Audio placeholders stay causal in HF and are deliberately not included."""
+    ids = [int(image_token_id)]
+    if video_token_id is not None and int(video_token_id) != int(image_token_id):
+        ids.append(int(video_token_id))
+    return ids
+
+
 def vision_block_ids(input_ids: torch.Tensor, vision_token_ids) -> torch.Tensor:
     """Block id per position: contiguous runs of vision placeholder tokens get 0, 1, 2, ...; text gets -1.
 
