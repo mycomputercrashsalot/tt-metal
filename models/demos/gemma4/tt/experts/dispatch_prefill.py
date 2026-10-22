@@ -15,6 +15,7 @@ Enabled with GEMMA4_MOE_DISPATCH_PREFILL=1 (see experts/__init__.py).
 import os
 from pathlib import Path
 
+import torch
 from loguru import logger
 
 import ttnn
@@ -62,6 +63,8 @@ class Gemma4DispatchExperts:
         self.rep_axis = 1 - self.dispatch_axis
         dgs, ndg = mesh_device.shape[self.dispatch_axis], mesh_device.shape[self.rep_axis]
         self.dgs, self.ndg = dgs, ndg
+        self._padding_cache: dict = {}  # n_tokens -> per-device [real, pad_side] (see _padding_config)
+        self._row_masks: dict = {}  # indices shape -> (row index, sentinel) TILE tensors
         assert dgs > 1, "the dispatch stack needs a dispatch group of more than one chip"
         # The stack's routing/dispatch tables are sharded with the groups over the mesh columns; on a single-row
         # mesh that leaves one chunk for N columns ("ND sharding requires the number of chunks 1 to match ...").
@@ -160,6 +163,61 @@ class Gemma4DispatchExperts:
             for e in range(E)
         ]
 
+    # ── Padding awareness (reference TtMoe / MiniMax contract) ─────────────────────────────────────────────
+    # A dispatch chunk is CHUNK_TOKENS rows; the rows past the chunk's real tokens are zero padding that the
+    # routing setup, dispatch, experts and combine would otherwise process (a 128-token prompt pads to 4096:
+    # 97% of the expert work wasted). With GEMMA4_DISPATCH_PADDING=1 the padded rows' expert ids are set to
+    # the sentinel (num_experts, whose dispatch-table column is -1) and dispatch gets the per-device
+    # [local_real_tokens, pad_side] config that bounds its token loop, exactly as the DeepSeek gate does.
+    PADDING_ENABLED = os.environ.get("GEMMA4_DISPATCH_PADDING", "1") != "0"
+
+    def _padding_config(self, n_tokens):
+        """Per-device ``[local_real_tokens, 0]`` (right padding) for a chunk with ``n_tokens`` real rows, or
+        None when every row is real. mesh_partition hands dispatch-axis chip r the rows [r*S, (r+1)*S)."""
+        S = self.seq_per_chip
+        if not self.PADDING_ENABLED or n_tokens >= CHUNK_TOKENS:
+            return None
+        if n_tokens not in self._padding_cache:
+            rows = [[min(S, max(0, n_tokens - r * S)), 0] for r in range(self.dgs)]
+            mesh_shape = tuple(self.mesh_device.shape)
+            dims = (0, None) if self.dispatch_axis == 0 else (None, 0)
+            self._padding_cache[n_tokens] = ttnn.from_torch(
+                torch.tensor(rows, dtype=torch.int32),
+                device=self.mesh_device,
+                dtype=ttnn.uint32,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=dims, mesh_shape=mesh_shape),
+            )
+        return self._padding_cache[n_tokens]
+
+    def _sentinel_padded_rows(self, indices, padding_config):
+        """Set the padded rows' expert ids (TILE, [S, K]) to the ``num_experts`` sentinel so the routing setup
+        counts nothing for them and dispatch maps them to -1 (mirrors TtMoEGatePrefill._sentinel_padded_rows)."""
+        key = tuple(indices.shape)
+        if key not in self._row_masks:
+            rows, k = indices.shape[-2], indices.shape[-1]
+            row_index = torch.arange(rows, dtype=torch.int16).reshape(rows, 1).expand(rows, k).reshape(key)
+            self._row_masks[key] = tuple(
+                ttnn.from_torch(
+                    t,
+                    device=self.mesh_device,
+                    dtype=indices.dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                )
+                for t in (row_index, torch.full_like(row_index, self.num_experts))
+            )
+        row_index, sentinel = self._row_masks[key]
+        real = ttnn.slice(padding_config, [0, 0], [1, 1])
+        real = ttnn.typecast(ttnn.to_layout(real, ttnn.TILE_LAYOUT), indices.dtype)
+        is_real = ttnn.lt(row_index, real)
+        out = ttnn.where(is_real, indices, sentinel)
+        for t in (real, is_real, indices):
+            ttnn.deallocate(t)
+        return out
+
     def _chunk(self, hidden, routing, n_tokens):
         """One dispatch chunk. hidden [1,1,T,H] and routing [1,1,T,E] replicated on every chip, T = CHUNK_TOKENS
         (rows beyond n_tokens are zero padding). Returns [1,1,T,H] replicated (full top-k sum)."""
@@ -170,6 +228,9 @@ class Gemma4DispatchExperts:
         weights, indices = ttnn.topk(r, k=self.top_k, dim=-1)  # [1,1,S,K] bf16 / uint16, TILE
         ttnn.deallocate(r)
         indices = ttnn.reshape(indices, (self.seq_per_chip, self.top_k))
+        padding_config = self._padding_config(n_tokens)
+        if padding_config is not None:
+            indices = self._sentinel_padded_rows(indices, padding_config)
         offsets, counts, region_offsets, _, _ = self.routing_setup(
             ttnn_top_k_experts_indices=indices,
             num_routed_experts=self.num_experts,
@@ -183,7 +244,9 @@ class Gemma4DispatchExperts:
         if x_rm.dtype != ttnn.bfloat16:
             x_rm = ttnn.typecast(x_rm, ttnn.bfloat16)
         ttnn.deallocate(x)
-        buffer, metadata = self.dispatch(x_rm, weights_rm, indices_rm, offsets, self.tt_dispatch_table)
+        buffer, metadata = self.dispatch(
+            x_rm, weights_rm, indices_rm, offsets, self.tt_dispatch_table, padding_config=padding_config
+        )
         ttnn.deallocate(x_rm)
         ttnn.deallocate(offsets)
         expert_out = self.routed_expert(ttnn.squeeze(ttnn.squeeze(buffer, dim=0), dim=0), counts, region_offsets)
