@@ -953,7 +953,7 @@ def test_multicast(device, name, grid, K_chunks):
         (
             None,
             ttnn.L1_BLOCK_SHARDED_MEMORY_CONFIG,
-            "Block-sharded output is incompatible with batch > 1",
+            "Sharded output is incompatible with batch > 1",
         ),
     ],
     ids=[
