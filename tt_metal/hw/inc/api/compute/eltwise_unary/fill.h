@@ -6,6 +6,7 @@
 
 #include "api/compute/common_globals.h"
 #ifdef TRISC_MATH
+// TODO(#61851): collapse to a single include once WH/BH fill moves to llk_sfpu
 #ifdef ARCH_QUASAR
 #include "ckernel_sfpu_fill.h"
 #else
