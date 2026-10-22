@@ -1756,10 +1756,16 @@ class Gemma4Model:
                     needs_grow = True
                     break
         if needs_alloc or needs_grow:
-            if needs_grow:
-                # Growing after decode-trace capture would leave execute_trace
-                # reading stale addresses; force a recapture on the next decode.
+            if needs_grow or by_batch:
+                # Growing after decode-trace capture would leave execute_trace reading stale
+                # addresses, and a batch key first seen after the capture (a lane group, a wider
+                # merged prefill) allocates where the replays scribble -- either way the next
+                # decode re-captures, whatever the trace guard's budget. The process's first key
+                # is the warmup's own and needs nothing.
                 self._invalidate_decode_traces_after_page_table_realloc = True
+                self._g4_page_table_realloc_reason = (
+                    "grow" if needs_grow else f"new batch key {batch_key} (keys {sorted(by_batch)})"
+                )
             persistent = []
             # Layers handed the same host table (one per kv-cache group) share one
             # device buffer: an update then costs one H2D per group, not per layer.

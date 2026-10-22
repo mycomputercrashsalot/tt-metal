@@ -2032,18 +2032,29 @@ class ChunkedPrefillPageTableGuardMixin:
             self._g4_trace_alloc_baseline[decode_trace_key] = tuple(min(b, c) for b, c in zip(baseline, current))
             return False
         limit = int(os.environ.get("GEMMA4_TRACE_ALLOC_GUARD_MAX", "8"))
+        now = time.monotonic()
         if self._g4_trace_guard_recaptures >= limit:
-            if self._g4_trace_guard_recaptures == limit:
-                self._g4_trace_guard_recaptures += 1
-                logger.error(
-                    "Gemma4: device allocations grew again after a decode-trace capture (baseline {} -> {}) "
-                    "but the re-capture limit ({}) is spent; replays may overwrite the new buffers",
-                    baseline,
-                    current,
-                    limit,
-                )
-            return False
+            # Past the budget, keep re-capturing but no more than once per interval: a load ramp with
+            # chunked prefills grows the allocator at nearly every step (buffers that live across a
+            # replay), and a first-time path landing after a spent budget (the first lane group on the
+            # Galaxy) was replayed over and hung the device. 0 = never re-capture past the budget.
+            interval = float(os.environ.get("GEMMA4_TRACE_ALLOC_GUARD_MIN_INTERVAL_S", "30"))
+            last = float(getattr(self, "_g4_trace_guard_last_recapture_t", 0.0))
+            if interval <= 0 or now - last < interval:
+                if not getattr(self, "_g4_trace_guard_limit_logged", False):
+                    self._g4_trace_guard_limit_logged = True
+                    logger.warning(
+                        "Gemma4: device allocations grew again after a decode-trace capture (baseline {} -> {}) "
+                        "and the re-capture budget ({}) is spent; further growth re-captures at most every {} s "
+                        "(GEMMA4_TRACE_ALLOC_GUARD_MIN_INTERVAL_S)",
+                        baseline,
+                        current,
+                        limit,
+                        interval,
+                    )
+                return False
         self._g4_trace_guard_recaptures += 1
+        self._g4_trace_guard_last_recapture_t = now
         logger.warning(
             "Gemma4: device allocations grew after the decode-trace capture (bytes per bank {} -> {}); "
             "re-capturing the decode traces ({}/{})",

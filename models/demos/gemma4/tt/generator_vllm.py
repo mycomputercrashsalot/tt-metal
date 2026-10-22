@@ -779,6 +779,13 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
             enable_trace = False
         elif enable_trace and _gemma4_prefill_trace_unsafe(self.model[0], self._bounded_sliding_kv_cache):
             prefill_forward_fn = self.prefill_forward
+        # Lane-group prefill after the eager decode warmup and before any capture:
+        # its persistent buffers must exist before the decode traces are recorded,
+        # but a lane-parallel prefill before the decode graph's first run hangs that
+        # run at boot (Galaxy, 2026-10-22), so it waits for the plugin's second
+        # (trace) pass (see the method).
+        if getattr(self, "_decode_warmup_complete", False):
+            self._g4_warmup_lane_prefill_group(kv_cache)
         warmup_gemma4_model_prefill(
             self,
             kv_cache,
@@ -792,7 +799,12 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         # serving skips this (``is_multimodal`` is False). The dummy-image warmup
         # is best-effort: if the synthesized geometry doesn't match the tower's
         # patch assertions, we log and defer compile to the first real request.
-        if self.is_multimodal:
+        # Once per process: the shared prefill path calls this warmup on every
+        # prefill batch (``warmup_prefill`` defaults to True), and re-encoding the
+        # dummy image each time cost ~170 ms of TTFT per batch and allocated
+        # behind the live decode traces.
+        if self.is_multimodal and not getattr(self, "_g4_vision_warmed", False):
+            self._g4_vision_warmed = True
             try:
                 self.warmup_vision()
             except Exception as e:  # noqa: BLE001 - warmup is best-effort
@@ -801,6 +813,58 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                     "deferring vision compile to first multimodal prefill.",
                     e,
                 )
+
+    def _g4_warmup_lane_prefill_group(self, kv_cache) -> None:
+        """Run one lane-group prefill at boot when the lane router is on (``lane_prefill_group``).
+
+        A lane group (one user per lane, one chunk walk) compiles its own programs and allocates
+        persistent buffers the per-user path never touches: the lanes-keyed per-layer page tables
+        and the lane-shaped CCL buffers. In serving the first group only forms once every lane has
+        a fresh prefill in the same step -- on the Galaxy that was minutes into the first load
+        phase, after the decode-trace allocation guard had spent its re-capture budget, so the
+        replays overwrote what that first group allocated and the second group hung the device.
+        Warming the path here puts those allocations below every capture. Once per process, and
+        only after the eager decode warmup (``_decode_warmup_complete``): run before the decode
+        graph's first step it hung that step at boot, so the plugin's two-pass warmup places it
+        between the eager pass and the trace pass.
+        """
+        if getattr(self, "_g4_lane_prefill_warmed", False) or not self._lane_prefill_group():
+            return
+        model = self.model[0]
+        mesh_cfg = getattr(model, "mesh_config", None)
+        if mesh_cfg is None or not getattr(mesh_cfg, "lane_sharded", False):
+            return
+        if kv_cache is None or kv_cache[0] is None:
+            return
+        self._g4_lane_prefill_warmed = True
+        lanes = int(mesh_cfg.lanes)
+        lane_slots = int(getattr(model, "lane_slots", 0) or 32)
+        seq_len = int(getattr(self.model_args[0], "max_prefill_chunk_size", 0) or 0)
+        if seq_len <= 0:
+            return
+        mock = self._mock_tokens(lanes, seq_len, kv_cache, 0)
+        page_table = mock.get("page_table")
+        if page_table is None:
+            return
+        # One slot per lane (slot s lives on lane s // lane_slots): the bounded sliding rings get
+        # ring-local tables for those slots and full-attention layers the mock's unique blocks.
+        slot_ids = [ln * lane_slots for ln in range(lanes)]
+        logger.info("Gemma4 vLLM: warming up the lane-group prefill path ({} lanes x {} tokens)", lanes, seq_len)
+        t0 = time.perf_counter()
+        try:
+            self.prefill_forward_lanes(
+                mock["tokens"],
+                page_table.reshape(lanes, 1, -1).to(torch.int32),
+                kv_cache,
+                [seq_len] * lanes,
+                slot_ids=slot_ids,
+            )
+        except Exception as e:  # noqa: BLE001 - warmup is best-effort; the router falls back per user
+            logger.warning("Gemma4 vLLM: lane-group prefill warmup failed ({}); the first group compiles live", e)
+        finally:
+            if hasattr(model, "_active_page_tables_per_layer"):
+                del model._active_page_tables_per_layer
+        logger.info("Gemma4 vLLM: lane-group prefill warmup done in {:.1f} s", time.perf_counter() - t0)
 
     # ── Multimodal (vision) path ───────────────────────────────────────────
     # Active only when ``is_multimodal`` is True (checkpoint has vision weights).
@@ -2406,7 +2470,8 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
             for m in self.model:
                 m._invalidate_decode_traces_after_page_table_realloc = False
             suffix = " [AFTER WARMUP — unsafe under async_scheduling]" if after_warmup else ""
-            reason = f"per-layer page-table buffer grow (addresses changed){suffix}"
+            what = ", ".join(sorted({str(getattr(m, "_g4_page_table_realloc_reason", "grow")) for m in self.model}))
+            reason = f"per-layer page-table buffer realloc ({what}; addresses changed){suffix}"
             # Release the stale Metal traces as the trace guard does: forgetting only their
             # ids leaked the trace-region buffers (a 1.2 GB region was spent after 45
             # re-captures, TT_FATAL at the next capture) and dropped the sampled-token
