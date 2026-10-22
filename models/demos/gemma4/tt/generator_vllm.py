@@ -430,7 +430,8 @@ def galaxy_lane_prefill_group():
 
 
 def _capability_flag(capabilities, key):
-    """A Boolean ``model_capabilities`` entry or a zero-argument callable one (the plugin resolves both)."""
+    """A Boolean ``model_capabilities`` entry or a zero-argument callable one (the plugin resolves the lane fold the
+    same way; ``lane_prefill_group`` is read only by this class)."""
     value = (capabilities or {}).get(key, False)
     return bool(value() if callable(value) else value)
 
@@ -527,9 +528,12 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         # floors the offset to resumed_prefill_token_alignment, so a prompt split
         # across engine steps needs no new prefill code.
         "supports_chunked_prefill": True,
-        # Lane serving (vllm-tt-plugin ``_convert_dp_to_lanes``): env-gated rails,
-        # so the plugin evaluates these zero-argument callables at config time.
+        # Lane serving (vllm-tt-plugin ``_convert_dp_to_lanes``): an env-gated rail,
+        # so the plugin evaluates this zero-argument callable at config time.
         "folds_dp_into_lanes": galaxy_lanes_fold,
+        # This class's own switch for the lane-parallel prefill router (not a plugin
+        # contract): the plugin side of lane-group prefill is the catalog's
+        # ``lane_prefill_admissions_per_step`` / ``lane_prefill_gather_ms`` tt config.
         "lane_prefill_group": galaxy_lane_prefill_group,
     }
 
@@ -1485,8 +1489,9 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
 
     @classmethod
     def _lane_prefill_group(cls):
-        """Lane-group prefill as declared (``model_capabilities["lane_prefill_group"]``): at most one
-        new prefill per lane per step, so a merged prefill step is a pure lane group."""
+        """Lane-parallel prefill router switch (``model_capabilities["lane_prefill_group"]``). The plugin's
+        admission cap / gather window (``lane_prefill_admissions_per_step``, ``lane_prefill_gather_ms`` in the
+        tt config) make merged prefill steps pure lane groups for it."""
         return _capability_flag(cls.model_capabilities, "lane_prefill_group")
 
     @classmethod
