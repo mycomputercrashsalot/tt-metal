@@ -77,6 +77,15 @@ class Gemma4MoEDecode:
         data["select_experts_k"] = self.top_k
         data["num_routed_experts"] = self.num_experts
         data["compute"]["intermediate_size"] = self.inter
+        # The lane axis has 4 chips, so the module takes the generic ``ttnn.reduce_scatter`` path (the fused DeepSeek
+        # reduce-scatter needs 8). That path rejects the fast reduce's default ND-sharded L1 output on current main
+        # (sharding_addrgen_helper: only block/height/width sharding), so the fast reduce writes interleaved DRAM.
+        data.setdefault("reduce", {})["output_memory_config"] = {
+            "buffer_type": 0,  # DRAM
+            "memory_layout": 0,  # INTERLEAVED
+            "created_with_nd_shard_spec": False,
+            "per_core_allocation": False,
+        }
         # the module's dispatch/compute ops require the ring fabric and Ring topology
         tt_config = TTMoEDecodeConfig.from_yaml(yaml.safe_dump(data, sort_keys=False), topology=ttnn.Topology.Ring)
         I = self.inter
