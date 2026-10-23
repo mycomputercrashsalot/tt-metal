@@ -227,7 +227,9 @@ def _process_prefill_chunk(hidden_states, routing_weights, weights: ExpertWeight
     # computing all E_loc experts and zeroing them through the routing weights below. Off by default: real
     # prefill chunks (group_size > 1) keep the dense down projection.
     sparse_down = (
-        chunk_len <= TILE_SIZE and sparsity is not None and os.environ.get("GEMMA4_MOE_FRAME_SPARSE_DOWN", "0") == "1"
+        chunk_len <= TILE_SIZE
+        and sparsity is not None
+        and os.environ.get("GEMMA4_MOE_FRAME_SPARSE_DOWN", "1" if is_blackhole() else "0") == "1"
     )
     down = ttnn.sparse_matmul(
         down_input,
