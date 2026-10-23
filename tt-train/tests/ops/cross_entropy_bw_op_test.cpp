@@ -5,18 +5,24 @@
 #include <gtest/gtest.h>
 #include <sys/types.h>
 
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <ttnn/operations/reduction/generic/generic_reductions.hpp>
 #include <ttnn/tensor/shape/shape.hpp>
+#include <utility>
 
 #include "autograd/auto_context.hpp"
 #include "core/system_utils.hpp"
 #include "core/tt_tensor_utils.hpp"
 #include "metal/operations.hpp"
+#include "metal/ops/cross_entropy_bw/device/cross_entropy_bw_device_operation.hpp"
 #include "ops/losses.hpp"
 #include "ops/unary_ops.hpp"
+#include "test_utils/program_cache.hpp"
 #include "test_utils/random_data.hpp"
 
 class CrossEntropyBackwardTest : public ::testing::Test {
@@ -32,6 +38,10 @@ public:
 protected:
     void SetUp() override {
         ttml::autograd::ctx().set_seed(42);
+    }
+
+    void TearDown() override {
+        ttml::autograd::ctx().reset_graph();
     }
 };
 
@@ -256,4 +266,222 @@ TEST_F(CrossEntropyBackwardTest, CrossEntropyForwardBackward_ReduceMeanVsNone) {
     EXPECT_TRUE(xt::allclose(result_none_after_mean_xtensor, result_mean_xtensor, 3e-2F, 1e-2F));
     assert((result_none_with_mean_after_grad.shape() == result_mean_grad.shape()));
     EXPECT_TRUE(xt::allclose(result_none_with_mean_after_grad, result_mean_grad, 3e-2F, 1e-2F));
+}
+
+namespace {
+
+using ttml::test_utils::two_core_group_seq_len;
+
+struct CrossEntropyBwLaunchTensors {
+    ttnn::Tensor input;
+    ttnn::Tensor target;
+    xt::xarray<float> input_values;  // bf16-rounded, as the device holds them
+    xt::xarray<uint32_t> target_values;
+};
+
+// Same specs for every call with the same (N, H, W); the values come from `seed`.
+CrossEntropyBwLaunchTensors make_inputs(uint32_t N, uint32_t H, uint32_t W, uint32_t seed) {
+    using namespace ttml;
+    auto* device = &autograd::ctx().get_device();
+    auto target_values =
+        test_utils::make_uniform_xarray<uint32_t>(std::array<std::size_t, 2>{N, H}, 0U, W - 1U, seed + 1U);
+    auto input = core::from_xtensor(
+        test_utils::make_uniform_xarray<float>(std::array<std::size_t, 4>{N, 1U, H, W}, -10.0F, 10.0F, seed), device);
+    auto target = core::from_xtensor<uint32_t, ttnn::DataType::UINT32>(target_values, device, ttnn::Layout::ROW_MAJOR);
+    auto input_values = core::to_xtensor(input);
+    return {std::move(input), std::move(target), std::move(input_values), std::move(target_values)};
+}
+
+// The gradient scales with `scaler`, so compare at unit scale: the absolute tolerance would accept anything for a
+// MEAN-sized scaler.
+void expect_grad_matches(
+    const ttnn::Tensor& result, const CrossEntropyBwLaunchTensors& in, float scaler, const std::string& launch) {
+    const xt::xarray<float> expected =
+        calculate_cross_entropy_backward(in.input_values, in.target_values, scaler) / scaler;
+    const xt::xarray<float> actual = ttml::core::to_xtensor(result) / scaler;
+    ASSERT_EQ(actual.shape(), expected.shape()) << launch;
+    EXPECT_TRUE(xt::allclose(actual, expected, 3e-2F, 1e-2F)) << launch;
+}
+
+}  // namespace
+
+// A program-cache hit re-patches only the input, target and output addresses. The first launch's tensors stay alive, so
+// every buffer of the second launch is at a new address: a stale one reads the first launch's data or overwrites its
+// result. Calls the prim because the public wrapper multiplies by grad: its op output is a temporary that the next
+// launch can get back at the same address, which would hide a stale output address.
+TEST_F(CrossEntropyBackwardTest, CrossEntropyBackward_CacheHitFreshTensors_TwoCoreGroups) {
+    using namespace ttml;
+    auto& device = autograd::ctx().get_device();
+    device.clear_program_cache();
+
+    const uint32_t N = 2U, H = two_core_group_seq_len(7U), W = 187U;
+    const float scaler = 1.0F;  // ReduceType::NONE
+    auto& rng = autograd::ctx().get_generator();
+    const uint32_t seed = rng();
+
+    const auto a = make_inputs(N, H, W, seed);
+    const auto entries_before_miss = device.num_program_cache_entries();
+    const auto result_a = ttnn::prim::ttml_cross_entropy_bw(a.input, a.target, scaler);
+    ASSERT_GT(device.num_program_cache_entries(), entries_before_miss) << "first launch did not populate the cache";
+    expect_grad_matches(result_a, a, scaler, "first launch");
+
+    const auto b = make_inputs(N, H, W, seed + 2U);
+    const auto entries_before_hit = device.num_program_cache_entries();
+    const auto result_b = ttnn::prim::ttml_cross_entropy_bw(b.input, b.target, scaler);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_before_hit) << "second launch was not a cache hit";
+    EXPECT_NE(b.input.buffer()->address(), a.input.buffer()->address());
+    EXPECT_NE(b.target.buffer()->address(), a.target.buffer()->address());
+    EXPECT_NE(result_b.buffer()->address(), result_a.buffer()->address());
+
+    expect_grad_matches(result_b, b, scaler, "cache hit");
+    expect_grad_matches(result_a, a, scaler, "first launch, re-read after the cache hit");
+}
+
+// The prim takes an optional preallocated output; the public wrapper never passes one. Launch without one, with one,
+// with a fresh one and without again, keeping every tensor alive: the last two launches are cache hits whether or not
+// the key depends on the output's presence, and each launch must write its own output. Then the other order on an
+// empty cache: build the program with a preallocated output, launch without one, then with a fresh one (a hit).
+// Preallocated outputs start at 5, which no gradient can be.
+TEST_F(CrossEntropyBackwardTest, CrossEntropyBackward_PreallocatedOutput_CacheHit) {
+    using namespace ttml;
+    auto& device = autograd::ctx().get_device();
+    device.clear_program_cache();
+
+    const uint32_t N = 2U, H = two_core_group_seq_len(7U), W = 61U;
+    const float scaler = 1.0F;
+    auto& rng = autograd::ctx().get_generator();
+    const uint32_t seed = rng();
+    const auto make_output = [&]() {
+        xt::xarray<float> sentinel = xt::empty<float>({N, 1U, H, W});
+        sentinel.fill(5.0F);
+        return core::from_xtensor(sentinel, &device);
+    };
+
+    const auto a = make_inputs(N, H, W, seed);
+    const auto entries_before_miss = device.num_program_cache_entries();
+    const auto result_a = ttnn::prim::ttml_cross_entropy_bw(a.input, a.target, scaler, std::nullopt);
+    ASSERT_GT(device.num_program_cache_entries(), entries_before_miss) << "first launch did not populate the cache";
+
+    const auto b = make_inputs(N, H, W, seed + 2U);
+    const auto output_b = make_output();
+    const auto result_b = ttnn::prim::ttml_cross_entropy_bw(b.input, b.target, scaler, output_b);
+
+    const auto c = make_inputs(N, H, W, seed + 4U);
+    const auto output_c = make_output();
+    auto entries_before_hit = device.num_program_cache_entries();
+    const auto result_c = ttnn::prim::ttml_cross_entropy_bw(c.input, c.target, scaler, output_c);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_before_hit) << "preallocated launch was not a cache hit";
+
+    const auto d = make_inputs(N, H, W, seed + 6U);
+    entries_before_hit = device.num_program_cache_entries();
+    const auto result_d = ttnn::prim::ttml_cross_entropy_bw(d.input, d.target, scaler, std::nullopt);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_before_hit) << "launch without output was not a cache hit";
+
+    EXPECT_EQ(result_b.buffer()->address(), output_b.buffer()->address());
+    EXPECT_EQ(result_c.buffer()->address(), output_c.buffer()->address());
+    EXPECT_NE(result_d.buffer()->address(), result_a.buffer()->address());
+
+    expect_grad_matches(result_a, a, scaler, "without preallocated output (miss)");
+    expect_grad_matches(output_b, b, scaler, "into preallocated output");
+    expect_grad_matches(output_c, c, scaler, "into a fresh preallocated output (hit)");
+    expect_grad_matches(result_d, d, scaler, "without preallocated output (hit)");
+
+    device.clear_program_cache();
+    const auto e = make_inputs(N, H, W, seed + 8U);
+    const auto output_e = make_output();
+    const auto entries_before_preallocated_miss = device.num_program_cache_entries();
+    const auto result_e = ttnn::prim::ttml_cross_entropy_bw(e.input, e.target, scaler, output_e);
+    ASSERT_GT(device.num_program_cache_entries(), entries_before_preallocated_miss)
+        << "first preallocated launch did not populate the cache";
+
+    const auto f = make_inputs(N, H, W, seed + 10U);
+    const auto result_f = ttnn::prim::ttml_cross_entropy_bw(f.input, f.target, scaler, std::nullopt);
+
+    const auto g = make_inputs(N, H, W, seed + 12U);
+    const auto output_g = make_output();
+    entries_before_hit = device.num_program_cache_entries();
+    const auto result_g = ttnn::prim::ttml_cross_entropy_bw(g.input, g.target, scaler, output_g);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_before_hit)
+        << "second preallocated launch was not a cache hit";
+
+    EXPECT_EQ(result_e.buffer()->address(), output_e.buffer()->address());
+    EXPECT_EQ(result_g.buffer()->address(), output_g.buffer()->address());
+
+    expect_grad_matches(output_e, e, scaler, "into preallocated output, on an empty cache (miss)");
+    expect_grad_matches(result_f, f, scaler, "without preallocated output, after a preallocated launch");
+    expect_grad_matches(output_g, g, scaler, "into a fresh preallocated output, after a launch without one (hit)");
+}
+
+// scaler is compiled into the writer and compute kernels, so it must be part of the program key: without it, the second
+// scaler's launch would replay the first scaler's program. Each scaler's second launch must hit its own program.
+TEST_F(CrossEntropyBackwardTest, CrossEntropyBackward_ScalerIsPartOfProgramCacheKey) {
+    using namespace ttml;
+    auto& device = autograd::ctx().get_device();
+    device.clear_program_cache();
+
+    const uint32_t N = 2U, H = two_core_group_seq_len(7U), W = 61U;
+    const float none_scaler = 1.0F;                                                    // ReduceType::NONE
+    const float mean_scaler = 1.0F / (static_cast<float>(N) * static_cast<float>(H));  // ReduceType::MEAN
+    auto& rng = autograd::ctx().get_generator();
+    const uint32_t seed = rng();
+    // Returns the result and how many program cache entries the launch added.
+    const auto launch = [&](const CrossEntropyBwLaunchTensors& in, float scaler) {
+        const auto entries_before = device.num_program_cache_entries();
+        auto result = ttnn::prim::ttml_cross_entropy_bw(in.input, in.target, scaler);
+        return std::pair{std::move(result), device.num_program_cache_entries() - entries_before};
+    };
+
+    const auto a = make_inputs(N, H, W, seed);
+    const auto [result_a, new_entries_a] = launch(a, none_scaler);
+    EXPECT_GT(new_entries_a, 0U) << "first scaler did not populate the cache";
+
+    const auto b = make_inputs(N, H, W, seed + 2U);
+    const auto [result_b, new_entries_b] = launch(b, mean_scaler);
+    EXPECT_GT(new_entries_b, 0U) << "second scaler reused the first scaler's program";
+
+    const auto c = make_inputs(N, H, W, seed + 4U);
+    const auto [result_c, new_entries_c] = launch(c, none_scaler);
+    EXPECT_EQ(new_entries_c, 0U) << "first scaler's second launch was not a cache hit";
+
+    const auto d = make_inputs(N, H, W, seed + 6U);
+    const auto [result_d, new_entries_d] = launch(d, mean_scaler);
+    EXPECT_EQ(new_entries_d, 0U) << "second scaler's second launch was not a cache hit";
+
+    expect_grad_matches(result_a, a, none_scaler, "first scaler (miss)");
+    expect_grad_matches(result_b, b, mean_scaler, "second scaler (miss)");
+    expect_grad_matches(result_c, c, none_scaler, "first scaler (hit)");
+    expect_grad_matches(result_d, d, mean_scaler, "second scaler (hit)");
+}
+
+// Two training steps through ops::cross_entropy_loss on fresh tensors, the first step's kept alive: the second step
+// builds no programs and must read its own prediction and target. Both ops' outputs are temporaries freed within each
+// step, so their output addresses are covered by each op's prim-level tests, not here. Checks the gradient that
+// reaches the prediction, which ReduceMeanVsNone does not.
+TEST_F(CrossEntropyBackwardTest, CrossEntropyLoss_MeanBackward_CacheHitFreshTensors) {
+    using namespace ttml;
+    auto& device = autograd::ctx().get_device();
+    device.clear_program_cache();
+
+    const uint32_t N = 2U, H = two_core_group_seq_len(7U), W = 61U;
+    const float scaler = 1.0F / (static_cast<float>(N) * static_cast<float>(H));  // what MEAN passes to the bw op
+    auto& rng = autograd::ctx().get_generator();
+    const uint32_t seed = rng();
+    const auto step = [](const CrossEntropyBwLaunchTensors& in) {
+        auto prediction = autograd::create_tensor(in.input, /* requires_grad */ true);
+        auto target = autograd::create_tensor(in.target);
+        auto loss = ops::cross_entropy_loss(prediction, target, ops::ReduceType::MEAN);
+        loss->backward();
+        return prediction;
+    };
+
+    const auto a = make_inputs(N, H, W, seed);
+    const auto prediction_a = step(a);
+    const auto entries_after_first_step = device.num_program_cache_entries();
+
+    const auto b = make_inputs(N, H, W, seed + 2U);
+    const auto prediction_b = step(b);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_after_first_step) << "second step built new programs";
+
+    expect_grad_matches(prediction_b->get_grad(), b, scaler, "second step");
+    expect_grad_matches(prediction_a->get_grad(), a, scaler, "first step, re-read after the second");
 }
