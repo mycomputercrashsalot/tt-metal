@@ -91,11 +91,12 @@ class Gemma4Precision:
             with open(_PATH) as f:
                 table = json.load(f)
         except FileNotFoundError:
-            return cls({})
+            table = {}
 
-        model_entry = table.get(model_key)
-        if not model_entry:
-            return cls({})
+        # A model without a table entry (the 26B) still takes the GEMMA4_PRECISION_* env overrides below: the
+        # old early return here silently ignored them, so GEMMA4_PRECISION_EXPERTS=bfp8 loaded bf16 experts
+        # under the bf16 cache identity with no log line.
+        model_entry = table.get(model_key) or {}
 
         # Mesh-specific override wins over "default"
         raw = model_entry.get(mesh_key) or model_entry.get("default") or {}
