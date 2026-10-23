@@ -12,13 +12,17 @@ import math
 import os
 
 import ttnn
+from models.common.utility_functions import is_blackhole
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 
 from .weights import ExpertWeights
 
 
 def _decode_sparse_matmul_knobs(mesh_device=None):
-    """Env knobs for the DECODE sparse_matmul program configs (all default to the shipped values).
+    """Program-config knobs for the DECODE sparse_matmuls (Blackhole defaults: the whole compute grid and a 22-tile
+    K block; env overrides). On the 4-chip 26B the shipped 8x8 / 1-tile config ran gate_up on 4 cores and down on 8
+    with one K tile per mcast block: 32 distinct users 148 -> 75 ms per traced step (6.7 -> 13.4 tok/s/user) with
+    these defaults, numerics identical.
 
     ``GEMMA4_SPARSE_MM_GRID=13x10`` lets the core grid use the whole Blackhole compute grid instead of the 8x8 the
     builder assumes (the 26B gate_up N=1408 -> 44 tiles only fits 4 cores in 8x8 but 11x4 in 13x10; down N=2816 ->
@@ -28,7 +32,7 @@ def _decode_sparse_matmul_knobs(mesh_device=None):
     caps the grid at the device's compute grid.
     """
     grid = None
-    env_grid = os.environ.get("GEMMA4_SPARSE_MM_GRID", "")
+    env_grid = os.environ.get("GEMMA4_SPARSE_MM_GRID", "device" if is_blackhole() else "")
     if env_grid:
         if env_grid.lower() in ("device", "full", "max") and mesh_device is not None:
             g = mesh_device.compute_with_storage_grid_size()
@@ -50,7 +54,7 @@ def _decode_sparse_matmul_knobs(mesh_device=None):
         }[env_fid]
     return {
         "max_grid": grid,
-        "in0_block_w": max(1, int(os.environ.get("GEMMA4_SPARSE_MM_IN0_BLOCK_W", "1"))),
+        "in0_block_w": max(1, int(os.environ.get("GEMMA4_SPARSE_MM_IN0_BLOCK_W", "22" if is_blackhole() else "1"))),
         "out_subblock_w": max(1, int(os.environ.get("GEMMA4_SPARSE_MM_OUT_SUBBLOCK_W", "1"))),
         "fidelity": fidelity,
     }
