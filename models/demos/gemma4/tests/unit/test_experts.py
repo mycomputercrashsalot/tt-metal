@@ -34,7 +34,7 @@ def test_experts(batch_size, seq_len, mesh_device, reset_seeds, request):
     run_experts(batch_size, seq_len, mesh_device, request)
 
 
-# single-row meshes (the 4-chip and 8-chip entries) are not supported by the dispatch stack's table sharding yet
+# the direct dispatch/combine ops run along mesh axis 0 only: single-row meshes take test_experts_dispatch_ring
 @skip_if_not_moe
 @pytest.mark.skipif(
     not is_blackhole(), reason="token-dispatch prefill runs the Blackhole-only unified_routed_expert_ffn"
@@ -45,6 +45,24 @@ def test_experts_dispatch(seq_len, mesh_device, reset_seeds, request, monkeypatc
     """Token-dispatch prefill (DeepSeek dispatch/combine + fused GeGLU experts) vs the HF reference; 4224 tokens
     exercise a partial second dispatch chunk."""
     monkeypatch.setenv("GEMMA4_MOE_DISPATCH_PREFILL", "1")
+    monkeypatch.setenv("GEMMA4_MOE_DISPATCH_MIN_TOKENS", "128")
+    run_experts(1, seq_len, mesh_device, request)
+
+
+# single-row meshes (the 4-chip and 8-chip entries) dispatch along their columns over the hop-forwarding
+# dispatch_fabric2d / combine_fabric2d pair, which needs the axis wrap-wired (FABRIC_1D_RING)
+@skip_if_not_moe
+@pytest.mark.skipif(
+    not is_blackhole(), reason="token-dispatch prefill runs the Blackhole-only unified_routed_expert_ffn"
+)
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 4), (1, 8)], device_params_extra={"fabric_config": ttnn.FabricConfig.FABRIC_1D_RING}
+)
+@pytest.mark.parametrize("seq_len", [128, 1024, 4096 + 128], ids=["prefill_128", "prefill_1024", "prefill_4224"])
+def test_experts_dispatch_ring(seq_len, mesh_device, reset_seeds, request, monkeypatch):
+    """Token-dispatch prefill on the ring transport (single-row mesh) vs the HF reference."""
+    monkeypatch.setenv("GEMMA4_MOE_DISPATCH_PREFILL", "1")
+    monkeypatch.setenv("GEMMA4_MOE_DISPATCH_RING", "1")
     monkeypatch.setenv("GEMMA4_MOE_DISPATCH_MIN_TOKENS", "128")
     run_experts(1, seq_len, mesh_device, request)
 

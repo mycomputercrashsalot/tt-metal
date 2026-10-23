@@ -10,7 +10,11 @@ chosen experts, the fused GeGLU routed-expert kernel runs only the selected expe
 outputs back to the token's row, and the reduce sums the top-k and reduce-scatters over the columns. Two
 all-gathers restore the replicated [tokens, hidden] layout the lane wrapper expects.
 
-Enabled with GEMMA4_MOE_DISPATCH_PREFILL=1 (see experts/__init__.py). The experts run on the model-local GeGLU op
+Enabled with GEMMA4_MOE_DISPATCH_PREFILL=1 (see experts/__init__.py). The direct ``dispatch`` / ``combine`` ops only
+run along mesh axis 0 ("cluster_axis must be 0 ... not tested"); a single-row mesh (the 4-chip / 8-chip entries)
+dispatches along its columns, which needs GEMMA4_MOE_DISPATCH_RING=1: the hop-forwarding ``dispatch_fabric2d`` /
+``combine_fabric2d`` pair on a wrap-wired axis (open the mesh with FABRIC_1D_RING; the model's own collectives can
+stay Linear). The experts run on the model-local GeGLU op
 (custom_ops/geglu_routed_expert, a ttnn.generic_op) over TtRoutedExpert's weights, buffers and index table;
 TtRoutedExpert itself only loads and caches the weights, its fused op never runs here.
 """
@@ -22,9 +26,9 @@ from loguru import logger
 
 import ttnn
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import ExpertMapping, compute_constants
-from models.demos.deepseek_v3_d_p.tt.moe.tt_combine import TtCombineModule
+from models.demos.deepseek_v3_d_p.tt.moe.tt_combine import TtCombine2dModule, TtCombineModule
 from models.demos.deepseek_v3_d_p.tt.moe.tt_dispatch import TtDispatchModule
-from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_routing_setup import TtMoERoutingSetup
+from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_routing_setup import MoERoutingOutputs, TtMoERoutingSetup
 from models.demos.deepseek_v3_d_p.tt.moe.tt_routed_expert import TtRoutedExpert
 from models.demos.gemma4.custom_ops.geglu_routed_expert import GegluRoutedExpert
 from models.demos.minimax_m3.tt.moe.tt_reduce import TtMiniMaxReduce
@@ -35,6 +39,52 @@ CHUNK_TOKENS = int(os.environ.get("GEMMA4_MOE_DISPATCH_CHUNK", "4096"))
 
 def dispatch_prefill_enabled():
     return os.environ.get("GEMMA4_MOE_DISPATCH_PREFILL", "0") == "1"
+
+
+class _RoutingSetupOnAxis(TtMoERoutingSetup):
+    """The reference routing setup shards its dispatch table over the mesh columns (one group per column) and runs
+    the cross-chip offset cumsum along the rows. On a single-row mesh the dispatch group IS the row (4-chip / 8-chip
+    entries): every column gets the one group's table row and the cumsum runs along ``cluster_axis`` = 1."""
+
+    def __init__(self, mesh_device, expert_dispatch_table, cluster_axis, **kwargs):
+        self.cluster_axis = cluster_axis
+        if cluster_axis == 1:
+            # the base class maps dims=(None, 0): dim 0 sharded over the columns -> replicate the single group row
+            assert expert_dispatch_table.shape[0] == 1, "a single-row mesh has one dispatch group"
+            expert_dispatch_table = expert_dispatch_table.repeat(mesh_device.shape[1], 1)
+        super().__init__(mesh_device, expert_dispatch_table, **kwargs)
+
+    def forward(self, ttnn_top_k_experts_indices, num_routed_experts, num_experts_per_tok):
+        if self.cluster_axis == 0:
+            return super().forward(ttnn_top_k_experts_indices, num_routed_experts, num_experts_per_tok)
+        assert isinstance(ttnn_top_k_experts_indices, ttnn.Tensor), "device indices only (the gate's TILE output)"
+        if ttnn_top_k_experts_indices.layout != ttnn.TILE_LAYOUT:
+            ttnn_top_k_experts_indices = ttnn.to_layout(ttnn_top_k_experts_indices, ttnn.TILE_LAYOUT)
+        if len(ttnn_top_k_experts_indices.shape) == 3:
+            ttnn_top_k_experts_indices = ttnn.squeeze(ttnn_top_k_experts_indices, 0)
+        expert_histograms = ttnn.experimental.deepseek_prefill.masked_bincount(
+            ttnn_top_k_experts_indices, self.experts_in_dispatch_group, num_routed_experts, num_experts_per_tok
+        )
+        (
+            global_dispatch_offsets,
+            total_counts_per_expert,
+            expert_region_offsets,
+            all_global_dispatch_offsets,
+        ) = ttnn.experimental.deepseek_prefill.offset_cumsum(
+            expert_histograms,
+            cluster_axis=self.cluster_axis,
+            num_links=self.num_links,
+            experts_per_chip=self.experts_per_chip,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            use_l1_small_for_semaphores=self.use_l1_small_for_semaphores,
+        )
+        return MoERoutingOutputs(
+            global_dispatch_offsets,
+            total_counts_per_expert,
+            expert_region_offsets,
+            expert_histograms,
+            all_global_dispatch_offsets,
+        )
 
 
 class Gemma4DispatchExperts:
@@ -69,54 +119,73 @@ class Gemma4DispatchExperts:
         self._padding_cache: dict = {}  # n_tokens -> per-device [real, pad_side] (see _padding_config)
         self._row_masks: dict = {}  # indices shape -> (row index, sentinel) TILE tensors
         assert dgs > 1, "the dispatch stack needs a dispatch group of more than one chip"
-        # The stack's routing/dispatch tables are sharded with the groups over the mesh columns; on a single-row
-        # mesh that leaves one chunk for N columns ("ND sharding requires the number of chunks 1 to match ...").
-        # The 4-chip and 8-chip entries keep the sparse expert path until that is generalized upstream.
-        assert rows > 1, "token-dispatch prefill needs a mesh with at least two rows (single-row meshes: sparse path)"
+        # The stack's routing table is sharded with the groups over the mesh columns and its offset cumsum runs
+        # along the rows; _RoutingSetupOnAxis carries the single-row mesh (one group over the columns).
         assert (
             CHUNK_TOKENS % (dgs * ttnn.TILE_SIZE) == 0
         ), f"chunk {CHUNK_TOKENS} must split into {dgs} tile-aligned rows"
         self.seq_per_chip = CHUNK_TOKENS // dgs
         topology = ttnn.Topology.Linear
+        # Ring transport (dispatch_fabric2d / combine_fabric2d): the only dispatch/combine pair that runs along
+        # mesh axis 1, so the single-row 4-chip and 8-chip entries need it; the axis must be a fabric ring.
+        self.ring = os.environ.get("GEMMA4_MOE_DISPATCH_RING", "0") == "1"
+        self.num_links = num_links
         experts_per_chip, metadata_len, max_buf, max_tok = compute_constants(
             self.seq_per_chip, self.num_experts, self.top_k, rows * cols, dgs, self.top_k
         )
         assert experts_per_chip == self.experts_per_chip
         assert max_buf >= dgs * self.seq_per_chip * self.top_k, "dispatch buffer below the drop-free worst case"
+        self.metadata_len, self.max_buf = metadata_len, max_buf
+        assert self.ring or self.dispatch_axis == 0, (
+            "the direct dispatch/combine ops only run along mesh axis 0: a single-row mesh needs "
+            "GEMMA4_MOE_DISPATCH_RING=1 (dispatch_fabric2d / combine_fabric2d on a FABRIC_1D_RING mesh)"
+        )
         table = ExpertMapping.create_dispatch_table(self.num_experts, dgs, ndg)
-        self.routing_setup = TtMoERoutingSetup(
-            mesh_device, table, num_links=num_links, experts_per_chip=experts_per_chip
+        self.routing_setup = _RoutingSetupOnAxis(
+            mesh_device, table, self.dispatch_axis, num_links=num_links, experts_per_chip=experts_per_chip
         )
         self.tt_dispatch_table = TtDispatchModule.shard_expert_dispatch_table(
             mesh_device, table, dispatch_axis=self.dispatch_axis
         )
-        self.dispatch = TtDispatchModule(
-            mesh_device=mesh_device,
-            dispatch_group_size=dgs,
-            experts_per_chip=experts_per_chip,
-            num_routed_experts=self.num_experts,
-            num_experts_per_tok=self.top_k,
-            metadata_len=metadata_len,
-            max_dispatch_buffer_token_size=max_buf,
-            seq_len_per_chip=self.seq_per_chip,
-            emb_dim=self.hidden,
-            cluster_axis=self.dispatch_axis,
-            num_links=num_links,
-            topology=topology,
-            subdevice_id=None,
-        )
-        self.combine = TtCombineModule(
-            mesh_device=mesh_device,
-            dispatch_group_size=dgs,
-            num_dispatch_groups=ndg,
-            experts_per_chip=experts_per_chip,
-            num_experts_per_tok=self.top_k,
-            seq_len_per_chip=self.seq_per_chip,
-            cluster_axis=self.dispatch_axis,
-            num_links=num_links,
-            topology=topology,
-            init_zeros=False,
-        )
+        if self.ring:
+            self.dispatch = None  # ttnn.experimental.deepseek_prefill.dispatch_fabric2d, called in _chunk
+            self.combine = TtCombine2dModule(
+                mesh_device=mesh_device,
+                experts_per_chip=experts_per_chip,
+                num_experts_per_tok=self.top_k,
+                seq_len_per_chip=self.seq_per_chip,
+                cluster_axis=self.dispatch_axis,
+                num_links=num_links,
+                topology=ttnn.Topology.Ring,
+            )
+        else:
+            self.dispatch = TtDispatchModule(
+                mesh_device=mesh_device,
+                dispatch_group_size=dgs,
+                experts_per_chip=experts_per_chip,
+                num_routed_experts=self.num_experts,
+                num_experts_per_tok=self.top_k,
+                metadata_len=metadata_len,
+                max_dispatch_buffer_token_size=max_buf,
+                seq_len_per_chip=self.seq_per_chip,
+                emb_dim=self.hidden,
+                cluster_axis=self.dispatch_axis,
+                num_links=num_links,
+                topology=topology,
+                subdevice_id=None,
+            )
+            self.combine = TtCombineModule(
+                mesh_device=mesh_device,
+                dispatch_group_size=dgs,
+                num_dispatch_groups=ndg,
+                experts_per_chip=experts_per_chip,
+                num_experts_per_tok=self.top_k,
+                seq_len_per_chip=self.seq_per_chip,
+                cluster_axis=self.dispatch_axis,
+                num_links=num_links,
+                topology=topology,
+                init_zeros=False,
+            )
         # global expert index table [groups, chips-in-group, ...]: dim 1 over the dispatch axis, dim 0 over the other
         idx_dims = (1, 0) if self.dispatch_axis == 0 else (0, 1)
         global_idx = ttnn.from_torch(
@@ -160,7 +229,8 @@ class Gemma4DispatchExperts:
             mesh_device=mesh_device, topk_dim=3, cluster_axis=self.rep_axis, num_links=num_links, topology=topology
         )
         logger.info(
-            f"Gemma4DispatchExperts: mesh {rows}x{cols}, {experts_per_chip} experts/chip, chunk {CHUNK_TOKENS} "
+            f"Gemma4DispatchExperts: mesh {rows}x{cols} axis {self.dispatch_axis} {'ring' if self.ring else 'direct'}, "
+            f"{experts_per_chip} experts/chip, chunk {CHUNK_TOKENS} "
             f"({self.seq_per_chip}/chip), dispatch buffer {max_buf} rows, max {max_tok} tokens/expert"
         )
 
@@ -246,7 +316,7 @@ class Gemma4DispatchExperts:
         padding_config = self._padding_config(n_tokens)
         if padding_config is not None:
             indices = self._sentinel_padded_rows(indices, padding_config)
-        offsets, counts, region_offsets, _, _ = self.routing_setup(
+        offsets, counts, region_offsets, _, all_offsets = self.routing_setup(
             ttnn_top_k_experts_indices=indices,
             num_routed_experts=self.num_experts,
             num_experts_per_tok=self.top_k,
@@ -259,15 +329,42 @@ class Gemma4DispatchExperts:
         if x_rm.dtype != ttnn.bfloat16:
             x_rm = ttnn.typecast(x_rm, ttnn.bfloat16)
         ttnn.deallocate(x)
-        buffer, metadata = self.dispatch(
-            x_rm, weights_rm, indices_rm, offsets, self.tt_dispatch_table, padding_config=padding_config
-        )
+        if self.ring:
+            # every source chip's offsets row ([extent, E], replicated along the axis): a forwarding chip sizes
+            # what it relays from them
+            buffer, metadata = ttnn.experimental.deepseek_prefill.dispatch_fabric2d(
+                x_rm,
+                indices_rm,
+                all_offsets,
+                self.tt_dispatch_table,
+                counts,
+                region_offsets,
+                padding_config=padding_config,
+                experts_per_chip=self.experts_per_chip,
+                num_routed_experts=self.num_experts,
+                num_experts_per_tok=self.top_k,
+                metadata_len=self.metadata_len,
+                max_dispatch_buffer_token_size=self.max_buf,
+                seq_len_per_chip=self.seq_per_chip,
+                cluster_axis=self.dispatch_axis,
+                num_links=self.num_links,
+                topology=ttnn.Topology.Ring,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        else:
+            buffer, metadata = self.dispatch(
+                x_rm, weights_rm, indices_rm, offsets, self.tt_dispatch_table, padding_config=padding_config
+            )
         ttnn.deallocate(x_rm)
         ttnn.deallocate(offsets)
-        expert_out = self.geglu_op(ttnn.squeeze(ttnn.squeeze(buffer, dim=0), dim=0), counts, region_offsets)
+        expert_out = self.geglu_op(ttnn.reshape(buffer, (self.max_buf, self.hidden)), counts, region_offsets)
         ttnn.deallocate(buffer)
         expert_out = ttnn.unsqueeze(ttnn.unsqueeze(expert_out, dim=0), dim=0)
-        combined = self.combine(expert_out, metadata, counts, region_offsets)  # [1,1,S,K,H] row-major
+        if self.ring:
+            combined = self.combine(expert_out, metadata, counts, region_offsets, all_offsets)  # [1,1,S,K,H]
+        else:
+            combined = self.combine(expert_out, metadata, counts, region_offsets)  # [1,1,S,K,H] row-major
+        ttnn.deallocate(all_offsets)
         ttnn.deallocate(expert_out)
         ttnn.deallocate(metadata)
         ttnn.deallocate(counts)

@@ -67,12 +67,20 @@ def _largest_divisor_at_most(n, cap):
     return 1
 
 
-def _build_sparse_matmul_config(m, n, in0_block_w=1, max_grid=None, k=None, out_subblock_w=1):
+def _build_sparse_matmul_config(
+    m, n, in0_block_w=1, max_grid=None, k=None, out_subblock_w=1, out_block_h=1, out_subblock_h=1
+):
     """Build program config for sparse_matmul following gpt-oss pattern.
 
     ``max_grid`` (cx, cy) bounds the core rectangle (default the 8x8 the original builder assumed); the largest
     core count dividing the N tiles that fits the rectangle is used, so every core owns ``per_core_N`` output
-    tiles and loops over the experts. ``k`` snaps ``in0_block_w`` to a divisor of the K tiles.
+    tiles and loops over the experts. ``k`` snaps ``in0_block_w`` to a divisor of the K tiles. ``out_block_h``
+    (snapped to a divisor of ``per_core_M``) is the M-block height: the kernel re-reads a core's in1 (weight)
+    column once per M block, so a prefill chunk of 16 row tiles with the default 1 reads every expert's weights
+    16 times; the in0 block it multicasts grows with it (``out_block_h * in0_block_w`` tiles, double buffered).
+    ``out_subblock_h`` (snapped to a divisor of ``out_block_h``, ``out_subblock_h * out_subblock_w <= 8`` dst tiles)
+    is the number of output row tiles accumulated per pass: with the default 1 x 1 subblock every tile product
+    costs two tile loads, an 8 x 1 subblock reuses each in1 tile over eight in0 tiles.
     """
     n_tiles = int(math.ceil(n / 32))
     max_cx, max_cy = max_grid if max_grid is not None else (8, 8)
@@ -96,15 +104,18 @@ def _build_sparse_matmul_config(m, n, in0_block_w=1, max_grid=None, k=None, out_
         in0_block_w = _largest_divisor_at_most(int(math.ceil(k / 32)), in0_block_w)
     # dst register file: out_subblock_h (1) * out_subblock_w <= 8; the subblock must divide per_core_N
     out_subblock_w = _largest_divisor_at_most(per_core_N, min(out_subblock_w, 8))
+    per_core_M = max(32, m) // 32
+    out_block_h = _largest_divisor_at_most(per_core_M, max(1, out_block_h))
+    out_subblock_h = _largest_divisor_at_most(out_block_h, max(1, min(out_subblock_h, 8 // out_subblock_w)))
 
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(best_cx, best_cy),
         in0_block_w=in0_block_w,
-        out_subblock_h=1,
+        out_subblock_h=out_subblock_h,
         out_subblock_w=out_subblock_w,
-        out_block_h=1,
+        out_block_h=out_block_h,
         out_block_w=per_core_N,
-        per_core_M=max(32, m) // 32,
+        per_core_M=per_core_M,
         per_core_N=per_core_N,
         fuse_batch=False,
         fused_activation=None,

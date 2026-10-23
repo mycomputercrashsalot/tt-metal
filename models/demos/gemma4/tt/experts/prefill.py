@@ -16,6 +16,7 @@ import os
 import torch
 
 import ttnn
+from models.common.utility_functions import is_blackhole
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 
 from .decode import _build_sparse_matmul_config, _decode_sparse_matmul_knobs
@@ -23,6 +24,46 @@ from .operations import apply_geglu
 from .weights import ExpertWeights
 
 TILE_SIZE = 32
+
+
+def _prefill_sparse_matmul_knobs(mesh_device):
+    """Program-config knobs for the real prefill chunks (chunk_len > 32): on by default on Blackhole
+    (``GEMMA4_SPARSE_MM_PREFILL=0`` restores the shipped 8x8 / 1-tile configs), off elsewhere. 4-chip 26B TTFT at
+    128 / 2048 / 8192 tokens: 462 / 6263 / 24876 -> 123 / 901 / 3619 ms, logits PCC 1.000000, same first tokens.
+
+    The shipped builder puts the 26B gate_up (N=1408 -> 44 tiles) on 4 cores and the down (N=2816 -> 88 tiles) on
+    8, one K tile per multicast block, for every 32-token group x expert pair; with the flag the decode knobs
+    (``GEMMA4_SPARSE_MM_GRID`` whole compute grid, ``GEMMA4_SPARSE_MM_IN0_BLOCK_W`` 22) apply to the chunks too:
+    gate_up on 44 cores, down on 88. On top of them:
+
+    * ``GEMMA4_SPARSE_MM_PREFILL_IN0_BLOCK_W`` (default 11) K tiles per multicast block;
+    * ``GEMMA4_SPARSE_MM_PREFILL_OUT_BLOCK_H`` (default 16) row tiles per M block: a core re-reads its weight
+      column once per M block, so a 512-token chunk (16 row tiles) reads every expert's weights 16x at 1 and
+      once at 16; the in0 block it multicasts is ``out_block_h * in0_block_w`` bf16 tiles double buffered
+      (16 x 11 = 704 KB, Blackhole L1; 16 x 22 overflows it). 2048-token prefill on the 4-chip 26B:
+      1 -> 2483 ms, 4 -> 1076, 8 -> 932, 16 x 11 -> 900;
+    * ``GEMMA4_SPARSE_MM_PREFILL_OUT_SUBBLOCK_H`` (default 1) output row tiles accumulated per pass (<= out_block_h,
+      <= 8 dst tiles). Measured slower than 1 (4 -> 1184 ms, 8 -> 1014 ms at out_block_h 4 / 8);
+    * ``GEMMA4_SPARSE_MM_PREFILL_ROUTE_EARLY`` (default 0): apply the routing weights to the GeGLU output
+      ([E_loc, chunk, I]) instead of the down-projection output ([E_loc, chunk, H]); exact in real arithmetic
+      and 4x less eltwise traffic (-35 ms), but the logits PCC vs the shipped path dropped to 0.63 (first token
+      changed) on the 2048-token prompt, so it stays off until that is understood;
+    * ``GEMMA4_SPARSE_MM_PREFILL_DENSE_GATE_UP`` (default 1): the gate_up runs the whole chunk (M = chunk rows)
+      against every local expert with the all-ones mask, like the down projection, instead of one 32-row group
+      per sparse batch entry. The per-group tile mask skips ~13% of the (group, expert) pairs (top-8 of 128 over
+      32 tokens) but re-reads each expert's weights once per group (64x per 2048 tokens); the dense form reads
+      them once per chunk, needs no group<->expert transpose, and the routing multiply after the down projection
+      still zeroes the unselected experts exactly as before.
+    """
+    if os.environ.get("GEMMA4_SPARSE_MM_PREFILL", "1" if is_blackhole() else "0") != "1":
+        return None
+    knobs = _decode_sparse_matmul_knobs(mesh_device)
+    knobs["in0_block_w"] = max(1, int(os.environ.get("GEMMA4_SPARSE_MM_PREFILL_IN0_BLOCK_W", "11")))
+    knobs["out_block_h"] = max(1, int(os.environ.get("GEMMA4_SPARSE_MM_PREFILL_OUT_BLOCK_H", "16")))
+    knobs["out_subblock_h"] = max(1, int(os.environ.get("GEMMA4_SPARSE_MM_PREFILL_OUT_SUBBLOCK_H", "1")))
+    knobs["route_early"] = os.environ.get("GEMMA4_SPARSE_MM_PREFILL_ROUTE_EARLY", "0") == "1"
+    knobs["dense_gate_up"] = os.environ.get("GEMMA4_SPARSE_MM_PREFILL_DENSE_GATE_UP", "1") == "1"
+    return knobs
 
 
 def create_prefill_sparsity(mesh_device, num_local_experts, mesh_config=None, ep=1):
@@ -92,24 +133,36 @@ def _process_prefill_chunk(hidden_states, routing_weights, weights: ExpertWeight
     hidden_size = config.hidden_size
     intermediate = weights.intermediate_size_per_device
     group_size = chunk_len // TILE_SIZE
-    hidden_grouped = ttnn.reshape(hidden_states, (1, group_size, TILE_SIZE, hidden_size))
-    routing_tiled = ttnn.reshape(routing_weights, (1, group_size, TILE_SIZE, num_local))
-    tile_mask = ttnn.max(routing_tiled, dim=2, keepdim=True)  # [1, group, 1, E_loc]
-    tile_mask = ttnn.to_layout(tile_mask, ttnn.ROW_MAJOR_LAYOUT)
-    sparsity = ttnn.reshape(tile_mask, (1, 1, group_size, num_local))
+    device = hidden_states.device()
     output_tile = ttnn.Tile([32, 32])
     math_fidelity = ttnn.MathFidelity.HiFi4
     # Decode frames (a batched decode step of up to 32 users lands here with chunk_len == 32) take the same
     # GEMMA4_SPARSE_MM_* program-config knobs as the batch-1 path in decode.py; all unset -> the shipped configs.
-    knobs = _decode_sparse_matmul_knobs(hidden_grouped.device()) if chunk_len <= TILE_SIZE else None
+    # Real prefill chunks take the GEMMA4_SPARSE_MM_PREFILL knobs (see _prefill_sparse_matmul_knobs), default off.
+    knobs = _decode_sparse_matmul_knobs(device) if chunk_len <= TILE_SIZE else _prefill_sparse_matmul_knobs(device)
+    out_block_h = knobs.get("out_block_h", 1) if knobs is not None else 1
+    out_subblock_h = knobs.get("out_subblock_h", 1) if knobs is not None else 1
+    dense_gate_up = bool(knobs.get("dense_gate_up", False)) if knobs is not None else False
+    route_early = bool(knobs.get("route_early", False)) if knobs is not None else False
+    if dense_gate_up:
+        # the all-ones [1,1,1,E_loc] mask: the whole chunk against every local expert (down-projection form)
+        sparsity = None
+    else:
+        hidden_grouped = ttnn.reshape(hidden_states, (1, group_size, TILE_SIZE, hidden_size))
+        routing_tiled = ttnn.reshape(routing_weights, (1, group_size, TILE_SIZE, num_local))
+        tile_mask = ttnn.max(routing_tiled, dim=2, keepdim=True)  # [1, group, 1, E_loc]
+        tile_mask = ttnn.to_layout(tile_mask, ttnn.ROW_MAJOR_LAYOUT)
+        sparsity = ttnn.reshape(tile_mask, (1, 1, group_size, num_local))
     if knobs is not None and (knobs["max_grid"] is not None or knobs["in0_block_w"] > 1 or knobs["out_subblock_w"] > 1):
         gate_up_config = _build_sparse_matmul_config(
-            TILE_SIZE,
+            chunk_len if dense_gate_up else TILE_SIZE,
             2 * intermediate,
             in0_block_w=knobs["in0_block_w"],
             max_grid=knobs["max_grid"],
             k=hidden_size,
             out_subblock_w=knobs["out_subblock_w"],
+            out_block_h=out_block_h,
+            out_subblock_h=out_subblock_h,
         )
         down_config = _build_sparse_matmul_config(
             chunk_len,
@@ -118,40 +171,64 @@ def _process_prefill_chunk(hidden_states, routing_weights, weights: ExpertWeight
             max_grid=knobs["max_grid"],
             k=intermediate,
             out_subblock_w=knobs["out_subblock_w"],
+            out_block_h=out_block_h,
+            out_subblock_h=out_subblock_h,
         )
     else:
-        gate_up_config = _build_sparse_matmul_config(TILE_SIZE, 2 * intermediate)
+        gate_up_config = _build_sparse_matmul_config(chunk_len if dense_gate_up else TILE_SIZE, 2 * intermediate)
         down_config = _build_sparse_matmul_config(chunk_len, hidden_size)
     if knobs is not None and knobs["fidelity"] is not None:
         math_fidelity = knobs["fidelity"]
     expert_compute_kernel_config = ttnn.init_device_compute_kernel_config(
-        hidden_grouped.device().arch(),
+        device.arch(),
         math_fidelity=math_fidelity,
         math_approx_mode=False,
         fp32_dest_acc_en=False,
         packer_l1_acc=False,
     )
-    up_gate = ttnn.sparse_matmul(
-        hidden_grouped,
-        weights.gate_up_proj,
-        sparsity=sparsity,
-        nnz=None,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        output_tile=output_tile,
-        program_config=gate_up_config,
-        compute_kernel_config=expert_compute_kernel_config,
-        dtype=ttnn.bfloat16,
-    )
-    up_gate = ttnn.transpose(up_gate, 1, 3)
+    if dense_gate_up:
+        # [1,1,chunk,H] x [1,E_loc,H,2I] -> [.., E_loc, chunk, 2I]: experts on the sparse batch dim, no transpose
+        up_gate = ttnn.sparse_matmul(
+            hidden_states,
+            weights.gate_up_proj,
+            sparsity=prefill_sparsity,
+            nnz=num_local,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            output_tile=output_tile,
+            program_config=gate_up_config,
+            compute_kernel_config=expert_compute_kernel_config,
+            dtype=ttnn.bfloat16,
+        )
+    else:
+        up_gate = ttnn.sparse_matmul(
+            hidden_grouped,
+            weights.gate_up_proj,
+            sparsity=sparsity,
+            nnz=None,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            output_tile=output_tile,
+            program_config=gate_up_config,
+            compute_kernel_config=expert_compute_kernel_config,
+            dtype=ttnn.bfloat16,
+        )
+        up_gate = ttnn.transpose(up_gate, 1, 3)
     up_gate = ttnn.reshape(up_gate, (1, num_local, chunk_len, 2 * intermediate))
     down_input = apply_geglu_fused(up_gate)
     up_gate.deallocate(True)
     down_input = ttnn.reshape(down_input, (1, num_local, chunk_len, intermediate))
+    routing_permuted = ttnn.permute(routing_weights, (0, 3, 2, 1))  # [1, E_loc, S, 1]
+    if route_early:
+        # weight each expert's GeGLU rows before the (linear) down projection: same sum, 4x smaller tensor
+        weighted = ttnn.mul(down_input, routing_permuted)
+        down_input.deallocate(True)
+        down_input = weighted
     # Decode frames with GEMMA4_MOE_FRAME_SPARSE_DOWN=1: the down projection skips the experts no user of the
     # frame routes to (the same [1,1,1,E_loc] tile mask the up/gate projection uses, nnz inferred) instead of
     # computing all E_loc experts and zeroing them through the routing weights below. Off by default: real
     # prefill chunks (group_size > 1) keep the dense down projection.
-    sparse_down = chunk_len <= TILE_SIZE and os.environ.get("GEMMA4_MOE_FRAME_SPARSE_DOWN", "0") == "1"
+    sparse_down = (
+        chunk_len <= TILE_SIZE and sparsity is not None and os.environ.get("GEMMA4_MOE_FRAME_SPARSE_DOWN", "0") == "1"
+    )
     down = ttnn.sparse_matmul(
         down_input,
         weights.down_proj,
@@ -166,8 +243,8 @@ def _process_prefill_chunk(hidden_states, routing_weights, weights: ExpertWeight
     )
     down_input.deallocate(True)
     next_states = ttnn.reshape(down, (1, num_local, chunk_len, hidden_size))
-    routing_permuted = ttnn.permute(routing_weights, (0, 3, 2, 1))  # [1, E_loc, S, 1]
-    next_states = ttnn.mul(next_states, routing_permuted)
+    if not route_early:
+        next_states = ttnn.mul(next_states, routing_permuted)
     routing_permuted.deallocate(True)
     # Reduce across experts dimension using fast_reduce_nc (gpt_oss pattern)
     next_states = ttnn.unsqueeze_to_4D(ttnn.experimental.fast_reduce_nc(next_states, dims=[1]))
