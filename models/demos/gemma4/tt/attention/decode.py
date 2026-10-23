@@ -10,6 +10,7 @@ Uses HF-style ttnn.experimental.rotary_embedding (no transformation matrices).
 import os
 
 import ttnn
+from models.demos.gemma4.custom_ops.rope_decode.op import RopeDecode
 from models.demos.gemma4.tt.compute_config import sdpa_fp32_dest_acc_en, sdpa_math_fidelity
 
 from .operations import (
@@ -169,9 +170,16 @@ def decode_forward(
             else:
                 cos_b, sin_b = base
 
+        # GEMMA4_ROPE_DECODE_CUSTOM_OP=1: one generic_op (custom_ops/rope_decode) per rotation instead of the
+        # ~8 elementwise programs of the composite (same NeoX rotate_half numerics, PCC 0.99999x); opt-in until
+        # the lanes roofline and the e2e answers are re-measured with it.
+        rope_custom_op = os.environ.get("GEMMA4_ROPE_DECODE_CUSTOM_OP", "0") == "1"
+
         def _rope(t):
             if batch == 1 and not peruser_at_b1:
                 return apply_rope(t, cos_pos, sin_pos, token_index=0)
+            if rope_custom_op:
+                return RopeDecode.op(t, cos_b, sin_b)
             return apply_rope_decode_peruser(t, cos_b, sin_b, prepared=rope_prepared)
 
         # Rotate Q (and K, unless this is a KV-shared layer) with the shared
