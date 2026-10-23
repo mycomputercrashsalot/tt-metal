@@ -283,6 +283,92 @@ def resolve_batched_prefill_chunk_users(padded_batch: int, prefill_seq_len: int)
     return supported[-1] if supported else 1
 
 
+# ── Packed multi-prompt prefill (GEMMA4_PACKED_PREFILL=1) ────────────────────────────────────────────────────────
+# N cold prompts of one padded bucket (e.g. 32 x 128 = 4096 tokens, the vLLM max_num_batched_tokens) run as ONE
+# prefill forward instead of N per-user calls: the rows are concatenated into a [1, 1, N*S, H] token stream for the
+# dense projections, the shared MLP, the router and the expert chunks (which see packed rows as plain tokens), and
+# attention reshapes to [N, heads, S, D] so SDPA is causal per segment (the batch dim is the segment: no
+# block-diagonal mask, sliding and full layers keep their own program configs, head_dim 256 / 512 unchanged). The
+# K/V of every user is written through its own page-table row (``paged_fill_cache(batch_idx=slot)``) and the
+# per-user last-token rows are gathered once for a single lm_head call. Eager only; cold prompts only
+# (``num_cached == 0``); prompts longer than one prefill chunk stay per user.
+_GEMMA4_PACKED_PREFILL_MM_KEYS = (
+    "pixel_values",
+    "pixel_values_videos",
+    "input_features",
+    "input_features_padded",
+    "images",
+    "image_embeds",
+)
+
+
+def gemma4_packed_prefill_enabled() -> bool:
+    """``GEMMA4_PACKED_PREFILL=1``: cold prompts of one padded bucket prefill as one packed forward."""
+    return os.environ.get("GEMMA4_PACKED_PREFILL", "0").lower() in ("1", "true", "yes")
+
+
+def _packed_prefill_value_present(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(v is not None for v in value)
+    return True
+
+
+def packed_prefill_max_tokens(max_prefill_chunk_size: int) -> int:
+    """Padded tokens one packed call may carry: ``GEMMA4_PACKED_PREFILL_MAX_TOKENS`` or the model's single-pass
+    prefill budget (``max_prefill_chunk_size``, the bound the stock batched path applies too: the flattened
+    ``[B*S, H]`` activations and the ``[B*S, E]`` routing are what the device has to hold at once)."""
+    raw = int(os.environ.get("GEMMA4_PACKED_PREFILL_MAX_TOKENS", "0"))
+    return raw if raw > 0 else int(max_prefill_chunk_size)
+
+
+def plan_packed_prefill_groups(
+    prompt_lens,
+    num_cached_per_user,
+    *,
+    max_prefill_chunk_size: int,
+    empty_slots=None,
+    max_batch_size: int = 32,
+    min_users: int = 2,
+    max_tokens: int | None = None,
+):
+    """Host-only plan of the packed calls: ``[(padded_len, [request idx, ...]), ...]`` (possibly empty).
+
+    Every cold request (``num_cached == 0``) whose padded length fits one prefill chunk joins its padded bucket;
+    a bucket with at least ``min_users`` requests is split, in request order, into calls that respect the
+    batched user / kernel caps (``resolve_batched_prefill_chunk_users``) and the per-call token budget
+    (``max_tokens``, default ``packed_prefill_max_tokens``). Requests outside every group (cached
+    continuations, long prompts, lone bucket members) stay on the stock per-user path.
+    """
+    if max_tokens is None:
+        max_tokens = packed_prefill_max_tokens(max_prefill_chunk_size)
+    buckets: dict[int, list[int]] = {}
+    for i, (plen, cached) in enumerate(zip(prompt_lens, num_cached_per_user)):
+        plen, cached = int(plen), int(cached)
+        if cached > 0 or plen <= 0:
+            continue
+        padded = int(get_padded_prefill_len(plen))
+        if padded > int(max_prefill_chunk_size):
+            continue
+        buckets.setdefault(padded, []).append(i)
+    groups = []
+    for padded in sorted(buckets):
+        idxs = buckets[padded]
+        if len(idxs) < min_users:
+            continue
+        slots = [int(empty_slots[i]) for i in idxs] if empty_slots is not None else idxs
+        span = batched_prefill_padded_batch(len(idxs), slots, max_batch_size)
+        cap = min(resolve_batched_prefill_chunk_users(min(span, max_batch_size), padded), int(max_tokens) // padded)
+        if span > max_batch_size or cap < min_users:
+            continue
+        for start in range(0, len(idxs), cap):
+            chunk = idxs[start : start + cap]
+            if len(chunk) >= min_users:
+                groups.append((padded, chunk))
+    return groups
+
+
 def mask_page_table_columns_past_allocation(page_tables, prompt_lens, block_sizes):
     """Zero every page-table column past each request's own allocation.
 
@@ -1278,6 +1364,153 @@ class ChunkedPrefillPageTableGuardMixin:
                 return self.model[model_id].process_logits_after_prefill_trace(tt_out, last_token_idx_for_trace)
             del tt_out
         raise RuntimeError("Traced multi-chunk prefill produced no last-chunk logits")
+
+    # ── Packed multi-prompt prefill (GEMMA4_PACKED_PREFILL=1) ──────────────────────────────────────────────────
+    def _g4_try_packed_prefill(self, call_kwargs: dict, *, run_rest):
+        """Serve a ``prefill_forward_text`` call as packed group forwards plus the stock path for the rest.
+
+        ``call_kwargs`` are the call's keyword arguments (``tokens``, ``page_table``, ``kv_cache``,
+        ``prompt_lens``, ``empty_slots``, ``start_pos``, ...); ``run_rest(**sub_kwargs)`` runs the stock path on
+        the requests no group took. Returns the ``[B, 1, vocab]`` host logits, or None when the call is not
+        packable (flag off, warmup, device sampling, hidden-state return, multimodal payload, cached prefixes
+        only, lanes, PLI models, DP > 1, pending deferred trace recording, no page table / KV cache).
+        """
+        if not gemma4_packed_prefill_enabled():
+            return None
+        tokens = call_kwargs.get("tokens")
+        page_table = call_kwargs.get("page_table")
+        kv_cache = call_kwargs.get("kv_cache")
+        if tokens is None or page_table is None or kv_cache is None or not torch.is_tensor(page_table):
+            return None
+        if call_kwargs.get("model_id_warmup") is not None or call_kwargs.get("sampling_params") is not None:
+            return None
+        if call_kwargs.get("return_hidden_states") or call_kwargs.get("page_tables_per_layer") is not None:
+            return None
+        if any(_packed_prefill_value_present(call_kwargs.get(k)) for k in _GEMMA4_PACKED_PREFILL_MM_KEYS):
+            return None
+        if getattr(self, "data_parallel", 1) != 1 or getattr(self, "_defer_trace_recording", False):
+            return None
+        # A traced first call owns the prefill warmup sweep and the traced decode preparation: pack after it.
+        # Eager serving (``--disable-trace-capture``) leaves ``already_warmed_up_prefill`` False after the
+        # plugin's two-phase warmup, and the stock eager sweep it would re-run only fills the program cache.
+        if (
+            call_kwargs.get("enable_trace", False)
+            and call_kwargs.get("warmup_prefill", True)
+            and not getattr(self, "already_warmed_up_prefill", False)
+        ):
+            return None
+        model = self.model[0]
+        args = self.model_args[0]
+        if getattr(args, "disable_batched_prefill", False) or getattr(model, "hidden_size_per_layer_input", 0):
+            return None
+        if getattr(getattr(model, "mesh_config", None), "lane_sharded", False):
+            return None
+        B = int(tokens.shape[0])
+        prompt_lens = call_kwargs.get("prompt_lens")
+        prompt_lens = [int(tokens.shape[1])] * B if prompt_lens is None else [int(p) for p in prompt_lens]
+        start_pos = call_kwargs.get("start_pos")
+        num_cached = [0] * B if start_pos is None else [int(n) for n in start_pos]
+        if len(prompt_lens) != B or len(num_cached) != B:
+            return None
+        empty_slots = call_kwargs.get("empty_slots")
+        slots_all = list(range(B)) if empty_slots is None else [int(x) for x in empty_slots]
+        groups = plan_packed_prefill_groups(
+            prompt_lens,
+            num_cached,
+            max_prefill_chunk_size=int(args.max_prefill_chunk_size),
+            empty_slots=slots_all,
+            max_batch_size=int(args.max_batch_size),
+        )
+        if not groups:
+            return None
+
+        self.mode = Mode.PREFILL
+        out = torch.zeros(B, 1, int(model.vocab_size))
+        packed = set()
+        for padded, idxs in groups:
+            t0 = time.perf_counter()
+            self._g4_prefill_packed_group(padded, idxs, tokens, page_table, kv_cache, prompt_lens, slots_all, out)
+            logger.info(
+                "[gemma4-packed-prefill] {} users x {} padded tokens in one forward: {:.1f} ms (slots {})",
+                len(idxs),
+                padded,
+                (time.perf_counter() - t0) * 1e3,
+                [slots_all[i] for i in idxs][:8],
+            )
+            packed.update(idxs)
+        rest = [i for i in range(B) if i not in packed]
+        if rest:
+            sub = {}
+            for key, value in call_kwargs.items():
+                if key == "kv_cache":
+                    pass  # per-model list, never per-request
+                elif isinstance(value, (list, tuple)) and len(value) == B:
+                    value = [value[i] for i in rest]
+                elif torch.is_tensor(value) and value.dim() >= 1 and int(value.shape[0]) == B:
+                    value = value[rest]
+                sub[key] = value
+            sub["prompt_lens"] = [prompt_lens[i] for i in rest]
+            sub["empty_slots"] = [slots_all[i] for i in rest]
+            sub["start_pos"] = None if start_pos is None else [num_cached[i] for i in rest]
+            sub["warmup_prefill"] = False
+            rest_out = run_rest(**sub)
+            if isinstance(rest_out, tuple):
+                raise RuntimeError("packed prefill remainder returned sampled tokens; host logits expected")
+            out[rest] = rest_out.reshape(len(rest), 1, -1)[..., : out.shape[-1]].to(out.dtype)
+        return out
+
+    def _g4_prefill_packed_group(self, padded, idxs, tokens, page_table, kv_cache, prompt_lens, slots_all, out):
+        """One packed forward: requests ``idxs`` at their physical slots, logits written into ``out`` rows."""
+        model_id = 0
+        model = self.model[model_id]
+        args = self.model_args[model_id]
+        model_kv = kv_cache[model_id]
+        slots = [slots_all[i] for i in idxs]
+        padded_batch = batched_prefill_padded_batch(len(idxs), slots, int(args.max_batch_size))
+        block_size = self._effective_paged_block_size(model_kv)
+        num_blocks = num_blocks_in_seq(padded, block_size)
+        pt_src = page_table if page_table.dim() > 1 else page_table.unsqueeze(0)
+        prefill_ids = torch.zeros(padded_batch, padded, dtype=torch.long)
+        last_idx = [0] * padded_batch  # pad slots: never filled (``valid_slots`` lists only the real ones)
+        pt = torch.zeros(padded_batch, num_blocks, dtype=torch.int32)
+        cols = min(num_blocks, int(pt_src.shape[1]))
+        for slot, i in zip(slots, idxs):
+            plen = int(prompt_lens[i])
+            prefill_ids[slot, :plen] = tokens[i, :plen].to(torch.long)
+            last_idx[slot] = plen - 1
+            pt[slot, :cols] = pt_src[i, :cols].to(torch.int32)
+        hidden = self.prefill_forward_single_user_text(
+            prefill_ids,
+            page_table=pt,
+            kv_cache=model_kv,
+            num_cached_tokens=0,
+            user_id=slots,
+            last_token_idx=last_idx,
+            model_id=model_id,
+            batch_size=padded_batch,
+        )
+        # Post-norm hidden [1, 1, padded_batch * padded, H]: gather every user's last-token row and run ONE
+        # lm_head on the [padded_batch, H] tile instead of a slice + lm_head + readback per slot.
+        hidden_dim = int(hidden.shape[-1])
+        hidden4 = ttnn.reshape(hidden, [padded_batch, 1, padded, hidden_dim])
+        rows = model.extract_last_tokens_batched_prefill(
+            hidden4, last_idx, padded_batch, padded, target_batch=max(padded_batch, 32)
+        )
+        for t in (hidden4, hidden):
+            try:
+                ttnn.deallocate(t, force=True)
+            except Exception:  # a reshape view shares the buffer freed by the first dealloc
+                pass
+        logits = model._apply_lm_head(rows, is_decode=False)
+        mesh_cfg = getattr(model, "mesh_config", None)
+        if mesh_cfg is not None and getattr(mesh_cfg, "tp", 1) > 1:
+            host = ttnn.to_torch(ttnn.get_device_tensors(logits)[0])
+        else:
+            host = ttnn.to_torch(logits)
+        ttnn.deallocate(logits, force=True)
+        host = host.reshape(-1, host.shape[-1])[:, : int(model.vocab_size)]
+        for slot, i in zip(slots, idxs):
+            out[i, 0] = host[slot].to(out.dtype)
 
     def prefill_forward_lanes(self, tokens, page_tables, kv_cache, prompt_lens, slot_ids=None):
         """Lane-parallel prefill, one user per lane column; returns host logits [lanes, vocab].
@@ -2338,6 +2571,28 @@ class Gemma4Generator(ChunkedPrefillPageTableGuardMixin, Generator):
             for seq_len, num_cached in zip(prompt_lens_list, num_cached_per_user)
         ]
         is_harmony = tokens.shape[1] > 0 and int(tokens[0, 0]) == 200006
+        # GEMMA4_PACKED_PREFILL=1: cold prompts of one padded bucket run as one packed forward (per-segment SDPA,
+        # per-slot KV, one lm_head); everything else (cached continuations, long prompts, singles) keeps the
+        # stock path below.
+        packed_out = self._g4_try_packed_prefill(
+            dict(
+                tokens=tokens,
+                page_table=page_table,
+                kv_cache=kv_cache,
+                prompt_lens=prompt_lens_list,
+                empty_slots=empty_slots,
+                enable_trace=enable_trace,
+                model_id_warmup=model_id_warmup,
+                sampling_params=sampling_params,
+                start_pos=start_pos,
+                return_hidden_states=return_hidden_states,
+                warmup_prefill=warmup_prefill,
+                **kwargs,
+            ),
+            run_rest=lambda **sub: super(Gemma4Generator, self).prefill_forward_text(**sub),
+        )
+        if packed_out is not None:
+            return packed_out
         # Batched prefill is eligible on identical *padded* buckets. Hetero
         # *actual* lengths are OK once per-slot ``valid_seq_lens`` caps KV fill
         # (see attention/prefill.py batched path) — do not require actual_lens_equal.

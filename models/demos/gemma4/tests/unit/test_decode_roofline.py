@@ -36,9 +36,23 @@ from models.demos.gemma4.tests.test_factory import parametrize_mesh_with_fabric,
 from models.demos.gemma4.tt.generator import Gemma4Generator
 from models.tt_transformers.tt.common import PagedAttentionConfig
 
-PREFILL_LEN = 128
+# Prefill (context) length before the measured decode steps. ``GEMMA4_ROOFLINE_PREFILL_LEN`` overrides it so the
+# step can be measured at served context sizes (128 / 2048 / 8192 / 32768); the page pool, the per-layer tables and
+# ``max_seq_len`` (``GEMMA4_ROOFLINE_MAX_SEQ_LEN``, default the power of two above prompt + steps, at least 4096)
+# follow it.
+PREFILL_LEN = int(os.environ.get("GEMMA4_ROOFLINE_PREFILL_LEN", "128"))
 WARM_STEPS = 4
 N_STEPS = int(os.environ.get("GEMMA4_ROOFLINE_STEPS", "3"))
+
+
+def _roofline_max_seq_len() -> int:
+    override = int(os.environ.get("GEMMA4_ROOFLINE_MAX_SEQ_LEN", "0"))
+    if override > 0:
+        return override
+    needed = PREFILL_LEN + WARM_STEPS + N_STEPS + 2
+    return max(4096, 1 << (needed - 1).bit_length())
+
+
 # Eager by default: the device profiler records each op of an eager step with its
 # host op record (name, type), which the split needs. Traced replays are not
 # attributed per op by the Tracy post-processing on this build, so the measured
@@ -76,11 +90,17 @@ def model_path():
     return os.environ.get("HF_MODEL", "google/gemma-4-31B-it")
 
 
-@parametrize_mesh_with_fabric(device_params_extra={"trace_region_size": 512_000_000})
+# The default line shapes plus the (2,4) block: an 8-chip engine opened as the 2-D mesh (plain TP over the columns,
+# EP over the rows), the orientation of one DP engine carved from the Galaxy (test_geglu_routed_expert selects
+# the same block).
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(1, 1), (1, 2), (1, 4), (1, 8), (2, 4), (1, 32)],
+    device_params_extra={"trace_region_size": 512_000_000},
+)
 @pytest.mark.parametrize("batch_size", [1, 32], ids=["batch_1", "batch_32"])
 def test_decode_roofline(mesh_device, model_path, batch_size):
     skip_if_config_only_checkpoint()
-    max_seq_len = 4096
+    max_seq_len = _roofline_max_seq_len()
     page_params = _batch_page_params(batch_size, PREFILL_LEN, WARM_STEPS + N_STEPS + 2)
     paged_attention_config = PagedAttentionConfig(
         block_size=int(page_params["page_block_size"]),
@@ -105,7 +125,11 @@ def test_decode_roofline(mesh_device, model_path, batch_size):
             max_seq_len=max_seq_len,
         )
 
-    prompt = tokenizer.encode("It was the best of times, it was the worst of times, " * 12, add_special_tokens=True)
+    # Natural repeated text long enough for any PREFILL_LEN (~14 tokens per repetition).
+    prompt = tokenizer.encode(
+        "It was the best of times, it was the worst of times, " * max(12, PREFILL_LEN // 8), add_special_tokens=True
+    )
+    assert len(prompt) >= PREFILL_LEN, f"prompt has {len(prompt)} tokens < PREFILL_LEN={PREFILL_LEN}"
     tokens = torch.tensor(prompt[:PREFILL_LEN]).unsqueeze(0).repeat(batch_size, 1)
     if os.environ.get("GEMMA4_ROOFLINE_DISTINCT_ROWS", "0") == "1" and batch_size > 1:
         # Distinct random prompts per user: with the same prompt on every row all users route to the same
@@ -174,10 +198,12 @@ def test_decode_roofline(mesh_device, model_path, batch_size):
 
     profiler_on = os.environ.get("TT_METAL_DEVICE_PROFILER") == "1"
     _flush()
+    row0_tokens = []
     _signpost("start")
     t0 = time.perf_counter()
     for _ in range(N_STEPS):
         tok = step(tok)
+        row0_tokens.append(int(tok[0, 0]))
         current_pos += 1
         ttnn.synchronize_device(mesh_device)
         if profiler_on:
@@ -186,9 +212,13 @@ def test_decode_roofline(mesh_device, model_path, batch_size):
     _signpost("stop")
     # Host wall time per step (synchronized): the serving-relevant number when traced and the profiler is off.
     logger.info(
-        f"WALL batch={batch_size} {'traced' if TRACED else 'eager'}: {wall_ms:.2f} ms/step = "
+        f"WALL batch={batch_size} {'traced' if TRACED else 'eager'} ctx={PREFILL_LEN} max_seq_len={max_seq_len} "
+        f"bounded={bounded_sliding}: {wall_ms:.2f} ms/step = "
         f"{1e3 / wall_ms:.2f} tok/s/user, {batch_size * 1e3 / wall_ms:.1f} tok/s aggregate ({N_STEPS} steps)"
     )
+    # The greedy continuation of the repeated prompt (row 0): a coherent repetition says the long-context KV and the
+    # traced replay are sane; garbage here would void the timing.
+    logger.info(f"ROW0_TOKENS ctx={PREFILL_LEN}: {tokenizer.decode(row0_tokens)!r}")
     try:
         ttnn.ReadDeviceProfiler(mesh_device)
     except Exception:  # profiler off: nothing to flush

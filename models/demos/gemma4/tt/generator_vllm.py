@@ -34,6 +34,7 @@ from models.demos.gemma4.tt.generator import (
     _build_vision_state_dict,
     _vision_encoder_seq_len,
     align_num_cached_tokens_to_sdpa,
+    gemma4_packed_prefill_enabled,
     mask_page_table_columns_past_allocation,
     max_batched_prefill_users,
     resolve_batched_prefill_chunk_users,
@@ -1195,6 +1196,15 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                 can_batch_prefill=can_batch_prefill,
                 empty_slots=kwargs.get("empty_slots"),
             )
+            if not args:
+                # GEMMA4_PACKED_PREFILL=1: the cold prompts of one padded bucket run as one packed forward
+                # (see ChunkedPrefillPageTableGuardMixin._g4_try_packed_prefill); the rest take the stock path.
+                packed_out = self._g4_try_packed_prefill(
+                    dict(kwargs, enable_trace=enable_trace),
+                    run_rest=lambda **sub: super(Gemma4ForCausalLM, self).prefill_forward_text(**sub),
+                )
+                if packed_out is not None:
+                    return packed_out
         return super().prefill_forward_text(*args, enable_trace=enable_trace, **kwargs)
 
     def _bounded_sliding_min_page_table_cols(self, kv_cache) -> int | None:
@@ -2294,7 +2304,9 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
             # wave-boundary corruption (~1-3/32 after a prior wave, prefill-mode
             # independent; repro: wave_smoke) and per-quadrant memory budgets
             # (see GEMMA4_MAX_BATCHED_PREFILL_USERS / GEMMA4_TAIL_POOL_SLOTS).
-            and os.environ.get("G4_FORCE_BATCH_PREFILL", "0") == "1"
+            # GEMMA4_PACKED_PREFILL=1 takes the same per-layer-table scatter/install (rows by physical slot)
+            # and then runs the packed forward from the wrapper's prefill_forward_text.
+            and (os.environ.get("G4_FORCE_BATCH_PREFILL", "0") == "1" or gemma4_packed_prefill_enabled())
         )
         use_sequential = batch_size > 1 and not will_batch
 
