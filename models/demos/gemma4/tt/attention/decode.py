@@ -37,6 +37,22 @@ from .weights import AttentionWeights
 # probe is skipped entirely.
 _Q_SHARDED_MEM_CACHE: dict = {}
 
+# GEMMA4_QKV_NORM_ROPE_FUSED=1: the per-head q/k/v norms and the q/k RoPE as one generic op on the height-sharded
+# head tensors (custom_ops/qkv_norm_rope); the TILE [1, 1, 1, head_dim] gamma rows it takes are built once per
+# layer from the ROW_MAJOR norm weights (keyed by the q weight's id; the weights live as long as the model).
+_GAMMA_TILES: dict = {}
+
+
+def _gamma_tiles(weights: AttentionWeights, head_dim: int):
+    key = id(weights.q_norm_weight)
+    if key not in _GAMMA_TILES:
+
+        def _tile(w):
+            return ttnn.to_layout(ttnn.reshape(w, (1, 1, 1, head_dim)), ttnn.TILE_LAYOUT)
+
+        _GAMMA_TILES[key] = (_tile(weights.q_norm_weight), _tile(weights.k_norm_weight))
+    return _GAMMA_TILES[key]
+
 
 def _sdpa_max_cores_per_head_kwargs() -> dict:
     """GEMMA4_SDPA_MAX_CORES_PER_HEAD=N pins the decode SDPA per-(row, head) core count. The op
@@ -107,8 +123,13 @@ def decode_forward(
     """
     tp = mesh_config.tp if mesh_config else 1
 
-    # 1. Fused QKV projection
-    xqkv = apply_qkv_projection(hidden_states, weights)
+    # 1. Fused QKV projection (GEMMA4_QKV_L1_OUT=1: straight into L1, where the head split reads it anyway --
+    # drops the DRAM -> L1 copy of the Blackhole workaround in split_qkv_heads_decode)
+    xqkv = apply_qkv_projection(
+        hidden_states,
+        weights,
+        memory_config=ttnn.L1_MEMORY_CONFIG if os.environ.get("GEMMA4_QKV_L1_OUT", "0") == "1" else None,
+    )
 
     # 2. Split into Q, K, V heads
     tt_q, tt_k, tt_v = split_qkv_heads_decode(
@@ -117,10 +138,30 @@ def decode_forward(
 
     # 3. Per-head norms (move to DRAM for rms_norm, restore sharded for RoPE)
     q_sharded_mem = tt_q.memory_config()
-    tt_q = ttnn.to_memory_config(tt_q, ttnn.DRAM_MEMORY_CONFIG)
-    tt_q = apply_per_head_norm(tt_q, weights.q_norm_weight, config.rms_norm_eps, with_scale=True)
+    fused_qkv = (
+        os.environ.get("GEMMA4_QKV_NORM_ROPE_FUSED", "0") == "1"
+        and not is_kv_shared
+        and rope_presliced
+        and len(cos_cache.shape) == 4
+        and int(cos_cache.shape[1]) == 1
+        and not (sequential_kv_write and int(tt_q.shape[1]) > 1)
+    )
+    if fused_qkv:
+        # norms + RoPE on the sharded head tensors, outputs in the same sharded layout (custom_ops/qkv_norm_rope)
+        from models.demos.gemma4.custom_ops.qkv_norm_rope import QkvNormRope
 
-    if is_kv_shared:
+        gq, gk = _gamma_tiles(weights, config.head_dim)
+        nq, nk, nv = QkvNormRope.op(tt_q, tt_k, tt_v, gq, gk, cos_cache, sin_cache, config.rms_norm_eps)
+        for t in (tt_q, tt_k, tt_v):
+            t.deallocate(True)
+        tt_q, tt_k, tt_v = nq, nk, nv
+    else:
+        tt_q = ttnn.to_memory_config(tt_q, ttnn.DRAM_MEMORY_CONFIG)
+        tt_q = apply_per_head_norm(tt_q, weights.q_norm_weight, config.rms_norm_eps, with_scale=True)
+
+    if fused_qkv:
+        pass
+    elif is_kv_shared:
         # KV-shared layer: discard own K/V, use source layer's KV cache directly
         tt_k.deallocate(True)
         tt_v.deallocate(True)
@@ -138,7 +179,9 @@ def decode_forward(
     #   - 2D cache: gather the position rows with ttnn.embedding right here (legacy
     #     per-layer path, kept for the it-assistant drafter / direct callers).
     use_embedding_rope = rope_presliced or len(cos_cache.shape) == 2
-    if use_embedding_rope:
+    if fused_qkv:
+        pass  # rotated by the fused op above
+    elif use_embedding_rope:
         if rope_presliced:
             cos_pos, sin_pos = cos_cache, sin_cache  # [1, 1, batch_pad, head_dim], shared
         else:
@@ -210,7 +253,7 @@ def decode_forward(
     )
     if kv_cache is not None:
         k_cache, v_cache = kv_cache
-        if not is_kv_shared:
+        if not is_kv_shared and not fused_qkv:
             # After HF-style RoPE, tensors may be in DRAM. Move to HEIGHT_SHARDED for cache update.
             tt_k = ttnn.to_memory_config(tt_k, q_sharded_mem)
             tt_v = ttnn.to_memory_config(tt_v, q_sharded_mem)

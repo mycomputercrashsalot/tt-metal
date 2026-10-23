@@ -10,6 +10,7 @@ No CPU round-trip.
 """
 
 import ttnn
+from models.demos.gemma4.tt.decode_matmul import flag, is_decode_rows
 from models.demos.gemma4.tt.experts import Gemma4ExpertConfig, Gemma4Experts
 from models.demos.gemma4.tt.router import Gemma4Router
 from models.demos.gemma4.utils.substate import substate
@@ -65,6 +66,19 @@ class MoEBlock:
         Returns:
             output: [1, 1, seq_len, hidden_size] on device
         """
+        lane_sharded = bool(self.mesh_config is not None and getattr(self.mesh_config, "lane_sharded", False))
+        if (
+            flag("GEMMA4_MOE_FUSED")
+            and not lane_sharded
+            and self.experts.ep == 1
+            and self.experts.moe_decode is None
+            and self.router.per_expert_scale is not None
+            and is_decode_rows(expert_input)
+        ):
+            # GEMMA4_MOE_FUSED=1: router tail, GeGLU and expert combine as custom ops (tp-only decode frames)
+            return self.experts(
+                expert_input, self.router.fused_routing(router_input, self.experts.weights, self.mesh_config)
+            )
         if self.experts.wants_sparse_routing(expert_input):
             # decode MoE kernel rows: top-k straight from the router (no dense scatter, no second top-k)
             return self.experts(expert_input, self.router(router_input, sparse=True))

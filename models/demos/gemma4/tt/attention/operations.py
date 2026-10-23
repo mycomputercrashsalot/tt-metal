@@ -657,6 +657,12 @@ def concat_heads(
         if num_heads is None or head_dim is None:
             raise ValueError("decode concat_heads requires num_heads and head_dim")
         batch = tensor.shape[1]
+        if os.environ.get("GEMMA4_CONCAT_HEADS_FUSED", "0") == "1" and not tensor.is_sharded():
+            # GEMMA4_CONCAT_HEADS_FUSED=1: one program straight from the interleaved SDPA output to the
+            # interleaved o_proj input (custom_ops/concat_heads_decode) instead of reshard, concat, reshard, slice
+            from models.demos.gemma4.custom_ops.concat_heads_decode import ConcatHeadsDecode
+
+            return ConcatHeadsDecode.op(tensor, num_heads)
         # One core per user (batch), arranged as a contiguous rectangle. A plain
         # num_cores_to_corerangeset spills into a non-rectangular set once
         # batch > grid width, which the height-sharded mem config rejects

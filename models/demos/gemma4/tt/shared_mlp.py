@@ -26,7 +26,7 @@ from models.demos.gemma4.tt.ccl import (
     ccl_lane_scatter_rows,
 )
 from models.demos.gemma4.tt.compute_config import gelu_variant
-from models.demos.gemma4.tt.decode_matmul import DecodeLinear, flag
+from models.demos.gemma4.tt.decode_matmul import DecodeLinear, flag, is_decode_rows
 from models.demos.gemma4.tt.dram_sharded import TILE_SIZE, DramShardedLinear, can_dram_shard
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
@@ -283,16 +283,24 @@ class SharedMLP:
         gate_up = self.gate_up_proj(hidden_states)
         shard = self._inter_per_device
         s = gate_up.shape[-2]
-        up = ttnn.slice(gate_up, [0, 0, 0, 0], [1, 1, s, shard])
-        gate = ttnn.slice(gate_up, [0, 0, 0, shard], [1, 1, s, 2 * shard])
-        gate_up.deallocate(True)
+        if flag("GEMMA4_MLP_GEGLU_FUSED") and is_decode_rows(gate_up) and shard % TILE_SIZE == 0:
+            # GEMMA4_MLP_GEGLU_FUSED=1: up * gelu(gate) over the fused [up | gate] output as one program
+            # (custom_ops/geglu_decode) instead of slice, slice, gelu, mul on the decode rows.
+            from models.demos.gemma4.custom_ops.geglu_decode import GegluDecode
 
-        # Prefer Accurate over FastLut/Tanh for device PCC (see compute_config): the Tanh variant
-        # dropped the E4B full-model PCC from 0.9846 to 0.9578 (gate 0.96) on bh_quietbox_2.
-        gate = ttnn.gelu(gate, variant=gelu_variant())
-        hidden = ttnn.mul(gate, up)
-        gate.deallocate(True)
-        up.deallocate(True)
+            hidden = GegluDecode.op(gate_up)
+            gate_up.deallocate(True)
+        else:
+            up = ttnn.slice(gate_up, [0, 0, 0, 0], [1, 1, s, shard])
+            gate = ttnn.slice(gate_up, [0, 0, 0, shard], [1, 1, s, 2 * shard])
+            gate_up.deallocate(True)
+
+            # Prefer Accurate over FastLut/Tanh for device PCC (see compute_config): the Tanh variant
+            # dropped the E4B full-model PCC from 0.9846 to 0.9578 (gate 0.96) on bh_quietbox_2.
+            gate = ttnn.gelu(gate, variant=gelu_variant())
+            hidden = ttnn.mul(gate, up)
+            gate.deallocate(True)
+            up.deallocate(True)
 
         # output = hidden @ down_proj
         output = self.down_proj(hidden)

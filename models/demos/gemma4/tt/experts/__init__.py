@@ -14,7 +14,7 @@ import torch
 import ttnn
 from loguru import logger
 
-from .decode import decode_forward
+from .decode import FusedRouting, decode_forward, decode_forward_fused
 from .prefill import create_prefill_sparsity, prefill_forward
 from .weights import ExpertWeights, load_expert_weights
 from models.demos.gemma4.tt.ccl import ccl_allreduce, ccl_lane_gather_rows, ccl_lane_scatter_rows
@@ -124,6 +124,18 @@ class Gemma4Experts:
 
     def __call__(self, hidden_states, dense_routing):
         lane_sharded = bool(self.mesh_config is not None and getattr(self.mesh_config, "lane_sharded", False))
+        if isinstance(dense_routing, FusedRouting):
+            # GEMMA4_MOE_FUSED=1: the fused router's tables, decode frame on whole-expert chips (no lane exchange)
+            assert self.ep == 1 and not lane_sharded, "the fused MoE decode path serves the tp-only shapes"
+            return decode_forward_fused(
+                hidden_states,
+                dense_routing,
+                weights=self.weights,
+                config=self.config,
+                mesh_config=self.mesh_config,
+                mesh_device=self.mesh_device,
+                ccl_manager=self.ccl_manager,
+            )
         # With EP=1 every lane holds the full expert set, so lane-local rows need no exchange.
         if lane_sharded and self.ep > 1:
             # Lanes hold different rows: gather every lane's rows (and their routing), run the

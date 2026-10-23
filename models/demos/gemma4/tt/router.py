@@ -108,6 +108,44 @@ class Gemma4Router:
             )
         else:
             self.per_expert_scale = None
+        self._fused = None  # (pes ROW_MAJOR, base tensor) of the fused router tail, built on first use
+
+    def _norm_scale(self, hidden_states):
+        """Steps 1-2: ``norm(x) * scale * hidden**-0.5`` (the folded one-program form on decode rows when
+        GEMMA4_ROUTER_FOLD_SCALE=1)."""
+        if flag("GEMMA4_NORM_FUSED") and is_decode_rows(hidden_states) and self.hidden_size % 32 == 0:
+            # norm, scale and hidden**-0.5 as one multi-core program (custom_ops/rms_norm_decode)
+            from models.demos.gemma4.custom_ops.rms_norm_decode import RmsNormDecode
+
+            return RmsNormDecode.op(hidden_states, self.scale, self.norm.eps, self.scalar_root_size)
+        if self.scale_folded is not None and is_decode_rows(hidden_states):
+            return ttnn.rms_norm(hidden_states, weight=self.scale_folded, epsilon=self.norm.eps)
+        normed = self.norm.forward(hidden_states)
+        scaled = ttnn.mul(normed, self.scale)
+        normed.deallocate(True)
+        return ttnn.mul(scaled, self.scalar_root_size)
+
+    def fused_routing(self, hidden_states, expert_weights, mesh_config):
+        """GEMMA4_MOE_FUSED=1 decode rows: norm, scale and projection as before, then ``custom_ops/router_topk``
+        (softmax, top-k, sum-normalize, per-expert scale, this chip's expert columns) in one program -> the
+        ``FusedRouting`` tables the fused expert path consumes."""
+        from models.demos.gemma4.custom_ops.router_topk import RouterTopk
+        from models.demos.gemma4.tt.experts.decode import FusedRouting
+
+        if self._fused is None:
+            pes = ttnn.to_layout(self.per_expert_scale, ttnn.ROW_MAJOR_LAYOUT)
+            base = RouterTopk.make_base(
+                self.mesh_device, mesh_config, expert_weights.num_local_experts, expert_weights.ep, expert_weights.tp
+            )
+            self._fused = (pes, base)
+        scaled = self._norm_scale(hidden_states)
+        logits = self.proj(scaled)
+        scaled.deallocate(True)
+        w, sparsity = RouterTopk.op(
+            logits, self._fused[0], self._fused[1], expert_weights.num_local_experts, self.top_k
+        )
+        logits.deallocate(True)
+        return FusedRouting(w, sparsity)
 
     def __call__(self, hidden_states, sparse=False):
         """

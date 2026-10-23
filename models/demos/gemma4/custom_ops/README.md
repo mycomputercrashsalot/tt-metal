@@ -10,8 +10,16 @@ repeats, pads), against a 1.7 ms DRAM floor. Each op here removes one such chain
 |---|---|---|
 | `rope_decode` | q/k RoPE as `(getitem x2, neg, concat, multiply, add) x2, multiply x2` per rotation (~8 programs after the per-step cos/sin hoist) | done: 9 unit tests (pcc 0.99999x vs golden and composite, identity exact), 64.7 -> 7.2 us device per b32h16d256 call (13 -> 1 programs); opt-in `GEMMA4_ROPE_DECODE_CUSTOM_OP=1` in `attention/decode.py` |
 | `geglu_routed_expert` | the shared `unified_routed_expert_ffn` edited for GeGLU (dispatch-prefill experts): now the only prefill expert path, TtRoutedExpert is the weight loader | done: bit-identical to the shared op with GeGLU, e2e dispatch PCC 0.99925 vs HF (128 / 1024 / 4224 tokens), same device time (541 us per 5633 rows per chip) |
-| `norm_reshard` (planned) | `to_memory_config -> rms_norm -> sharded_to_interleaved` triples (11/layer) | keep the residual stream sharded first |
-| `router_topk` (planned) | `softmax, topk, sum, div` + the kernel-side re-top-k | sparse routing pass-through landed first |
+| `rms_norm_decode` | the decode `to_memory_config -> rms_norm (width-sharded) -> sharded_to_interleaved` triple of every layer norm (7/layer) and the router's `rms_norm, mul, mul` | multi-core (11 cores on the 26B width) interleaved RMSNorm with a NoC partial-sum exchange, gamma and scalar folded; opt-in `GEMMA4_NORM_FUSED=1` (`tt/rms_norm.py`, `tt/router.py`) |
+| `router_topk` | `softmax, topk (+fillpad), sum (fillpad+reduce), div, zeros_like, scatter (5), mul, matmul (expert select), max, to_layout, permute` (15/layer) | 32 RISC-V cores rank their user's row, core 0 gathers the local weight table `[E_loc, 32]` + the sparsity row; opt-in `GEMMA4_MOE_FUSED=1` (`tt/moe.py`, `tt/router.py`) |
+| `geglu_decode` | experts `transpose, slice, slice, gelu, mul` (5/layer) and shared-MLP `slice, slice, gelu, mul` (4/layer) | `up * gelu(gate)` over the fused `[up | gate]` activation, exact GELU on fp32 dest; `GEMMA4_MOE_FUSED=1` (experts) / `GEMMA4_MLP_GEGLU_FUSED=1` (`tt/shared_mlp.py`) |
+| `moe_combine` | `permute, mul, fast_reduce_nc` (3/layer) | per column tile the FPU column-broadcast products of the local experts accumulated on fp32 dest; reads only the selected experts' tiles; `GEMMA4_MOE_FUSED=1` (`tt/experts/decode.py::decode_forward_fused`) |
+| `qkv_norm_rope` | `to_memory_config x3 (sharded -> DRAM), rms_norm x3, q/k RoPE (7 each or rope_decode), to_memory_config x2` (21/layer) | per-head norms + RoPE in place on the height-sharded head tensors (tensor-backed CBs), cos/sin rows taken straight from the per-step gather; opt-in `GEMMA4_QKV_NORM_ROPE_FUSED=1` (`tt/attention/decode.py`) |
+| `concat_heads_decode` | `to_memory_config (-> height sharded), nlp_concat_heads_decode, sharded_to_interleaved (, slice)` (3-4/layer) | one data-movement program from the interleaved SDPA output to the interleaved o_proj input; opt-in `GEMMA4_CONCAT_HEADS_FUSED=1` (`tt/attention/operations.py`) |
+
+Call-site switches without a kernel: `GEMMA4_QKV_L1_OUT=1` (the wqkv projection writes L1, dropping the DRAM -> L1 copy of
+the Blackhole head-split workaround), `GEMMA4_SOFTCAP_FUSED=1` (`ttnn.softcap` for the `mul, tanh, mul` of the lm head).
+Measurements (traced ms/step, program counts) are in `_logs/a9_summary.tsv` / the 2026-10-23 report.
 
 Layout of an op folder:
 
@@ -20,3 +28,16 @@ custom_ops/<op>/op.py        # class <Op>: golden(torch) + op(ttnn tensors) -> t
 custom_ops/<op>/kernels/     # reader_<op>.cpp, compute_<op>.cpp, writer_<op>.cpp
 tests/unit/custom_ops/test_<op>.py
 ```
+
+Kernel traps found while writing these (2026-10-23, Blackhole, `ttnn.generic_op`):
+
+* An FPU write (`mul_tiles*`, `copy_tile`) to a dest tile that an earlier SFPU op of the same acquire window reads
+  corrupts the result (`moe_combine`: wrong sums from 3 experts on). Issue every unpack copy / FPU op of a window
+  before its first SFPU op, or pass the running value through an L1 CB between windows.
+* `pack_tile(idst, cb, index)` writes sequentially from the reserved block regardless of `index`; an out-of-order
+  index needs `pack_tile<true>(...)` (`qkv_norm_rope`: pages 0,4,1,5 landed in 0,1,2,3). Pack in page order.
+* The math core (TRISC1) has no `cb_interface`: a compute kernel cannot read a data-dependent count from a CB
+  (`moe_combine`: fixed expert loop, the reader pushes zero weight tiles for the experts nobody selected).
+* `get_read_ptr` is a dataflow-only free function; compute kernels use `CircularBuffer::get_read_ptr()`.
+* A kernel-side `union F32` collides with `dprint.h`; and the ROW_MAJOR / TILE row tile of the position-gathered
+  cos / sin can be copied per user by the reader (32-byte face rows), so no per-step transpose / slice / repeat.

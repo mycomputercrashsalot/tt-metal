@@ -10,12 +10,17 @@ sparse_matmul output is 6D: [batch_dims..., num_experts, seq_tiles, n_dim].
 
 import math
 import os
+from collections import namedtuple
 
 import ttnn
 from models.common.utility_functions import is_blackhole
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 
 from .weights import ExpertWeights
+
+# The fused router's routing form (GEMMA4_MOE_FUSED=1, custom_ops/router_topk): ``w`` [1, 1, E_loc, 32] bf16
+# ROW_MAJOR (row e = the users' weights of local expert e) and ``sparsity`` [1, 1, 1, E_loc] bf16 ROW_MAJOR.
+FusedRouting = namedtuple("FusedRouting", "w sparsity")
 
 
 def _decode_sparse_matmul_knobs(mesh_device=None):
@@ -242,4 +247,91 @@ def decode_forward(
     if mesh_config is not None and mesh_config.tp > 1:
         next_states = ccl_allreduce(next_states, mesh_config, ccl_manager)
 
+    return next_states
+
+
+def decode_forward_fused(
+    hidden_states,
+    routing: FusedRouting,
+    weights: ExpertWeights,
+    config,
+    mesh_config=None,
+    mesh_device=None,
+    ccl_manager=None,
+    combine=True,
+):
+    """GEMMA4_MOE_FUSED=1 decode frame (<= 32 users on one row tile, every chip holds whole experts, ep == 1):
+    the fused router's ``(w, sparsity)`` drive the gate_up ``sparse_matmul`` (L1 output), ``GegluDecode`` (one
+    program for the slices / gelu / mul and the 6-D transpose), the down ``sparse_matmul`` and ``MoeCombine``
+    (one program for the routing multiply and the expert sum), then the tp all-reduce. Same sparse_matmul configs
+    and fidelity as ``decode_forward``; the sparsity is data-dependent (``nnz`` inferred) as before."""
+    from models.demos.gemma4.custom_ops.geglu_decode import GegluDecode
+    from models.demos.gemma4.custom_ops.moe_combine import MoeCombine
+
+    batch_size = int(hidden_states.shape[2])
+    num_local = weights.num_local_experts
+    intermediate_size = weights.intermediate_size_per_device
+    hidden_size = config.hidden_size
+    output_tile = ttnn.Tile([32, 32])
+    knobs = _decode_sparse_matmul_knobs(mesh_device)
+    gate_up_config = _build_sparse_matmul_config(
+        batch_size,
+        2 * intermediate_size,
+        in0_block_w=knobs["in0_block_w"],
+        max_grid=knobs["max_grid"],
+        k=hidden_size,
+        out_subblock_w=knobs["out_subblock_w"],
+    )
+    down_config = _build_sparse_matmul_config(
+        batch_size,
+        hidden_size,
+        in0_block_w=knobs["in0_block_w"],
+        max_grid=knobs["max_grid"],
+        k=intermediate_size,
+        out_subblock_w=knobs["out_subblock_w"],
+    )
+    compute_kernel_config = None
+    if knobs["fidelity"] is not None:
+        compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            hidden_states.device().arch(),
+            math_fidelity=knobs["fidelity"],
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        )
+    mem = ttnn.L1_MEMORY_CONFIG if os.environ.get("GEMMA4_MOE_FUSED_L1", "1") == "1" else ttnn.DRAM_MEMORY_CONFIG
+    up_gate = ttnn.sparse_matmul(
+        hidden_states,
+        weights.gate_up_proj,
+        sparsity=routing.sparsity,
+        nnz=None,
+        memory_config=mem,
+        output_tile=output_tile,
+        program_config=gate_up_config,
+        compute_kernel_config=compute_kernel_config,
+        dtype=ttnn.bfloat16,
+    )
+    up_gate = ttnn.reshape(up_gate, (1, num_local, batch_size, 2 * intermediate_size))  # 6-D -> 4-D view
+    down_input = GegluDecode.op(up_gate)
+    up_gate.deallocate(True)
+    down = ttnn.sparse_matmul(
+        down_input,
+        weights.down_proj,
+        sparsity=routing.sparsity,
+        nnz=None,
+        memory_config=mem,
+        output_tile=output_tile,
+        program_config=down_config,
+        is_input_a_sparse=True,
+        compute_kernel_config=compute_kernel_config,
+        dtype=ttnn.bfloat16,
+    )
+    down_input.deallocate(True)
+    down = ttnn.reshape(down, (1, num_local, batch_size, hidden_size))
+    next_states = MoeCombine.op(down, routing.w)
+    down.deallocate(True)
+    if not combine:
+        return next_states
+    if mesh_config is not None and mesh_config.tp > 1:
+        next_states = ccl_allreduce(next_states, mesh_config, ccl_manager)
     return next_states
