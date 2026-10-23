@@ -10,7 +10,9 @@ Prefill (seq_len>1): on-device via sparse_matmul with all-ones sparsity (gpt_oss
 
 import os
 
+import torch
 import ttnn
+from loguru import logger
 
 from .decode import decode_forward
 from .prefill import create_prefill_sparsity, prefill_forward
@@ -102,6 +104,24 @@ class Gemma4Experts:
                 num_layers=num_layers,
             )
 
+    def wants_sparse_routing(self, hidden_states):
+        """True when this call will run the decode MoE kernel, which takes the router's (values, indices)
+        directly (``GEMMA4_SPARSE_ROUTING=0`` keeps the dense routing matrix everywhere)."""
+        if self.moe_decode is None or os.environ.get("GEMMA4_SPARSE_ROUTING", "1") == "0":
+            return False
+        rows = int(hidden_states.shape[2])
+        lane_sharded = bool(self.mesh_config is not None and getattr(self.mesh_config, "lane_sharded", False))
+        if lane_sharded and self.ep > 1:
+            if getattr(self.mesh_config, "_g4_single_lane_prefill_owner", None) is not None:
+                return False  # single-user prefill: the owner block feeds the kernel its dense routing matrix
+            rows = (rows + (-rows) % 32) * self.mesh_config.lanes
+        return 1 < rows <= self.moe_decode.frame_rows
+
+    @staticmethod
+    def _routing_parts(routing):
+        """(values, indices) for sparse routing, (dense, None) for the dense matrix."""
+        return (routing[0], routing[1]) if isinstance(routing, tuple) else (routing, None)
+
     def __call__(self, hidden_states, dense_routing):
         lane_sharded = bool(self.mesh_config is not None and getattr(self.mesh_config, "lane_sharded", False))
         # With EP=1 every lane holds the full expert set, so lane-local rows need no exchange.
@@ -115,11 +135,34 @@ class Gemma4Experts:
             # them out of the expert sums.
             rows = hidden_states.shape[2]
             pad_rows = (-rows) % 32
+            dense_routing, sparse_idx = self._routing_parts(dense_routing)
+            if sparse_idx is not None:
+                sparse_idx = ttnn.typecast(sparse_idx, ttnn.bfloat16)  # exact for expert ids; the gather wants bf16
             if pad_rows:
                 hidden_states = ttnn.pad(hidden_states, [(0, 0), (0, 0), (0, pad_rows), (0, 0)], value=0.0)
                 dense_routing = ttnn.pad(dense_routing, [(0, 0), (0, 0), (0, pad_rows), (0, 0)], value=0.0)
+                if sparse_idx is not None:
+                    # Distinct ids per k on the pad rows (a row of equal ids hangs the decode kernel's dispatch).
+                    k = int(sparse_idx.shape[-1])
+                    pad_ids = ttnn.from_torch(
+                        torch.arange(k, dtype=torch.float32).repeat(pad_rows, 1).reshape(1, 1, pad_rows, k),
+                        device=self.mesh_device,
+                        dtype=ttnn.bfloat16,
+                        layout=ttnn.ROW_MAJOR_LAYOUT,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                    )
+                    sparse_idx = ttnn.concat([ttnn.to_layout(sparse_idx, ttnn.ROW_MAJOR_LAYOUT), pad_ids], dim=2)
+                    sparse_idx = ttnn.to_layout(sparse_idx, ttnn.TILE_LAYOUT)
             hidden_states = ccl_lane_gather_rows(hidden_states, self.mesh_config)
             dense_routing = ccl_lane_gather_rows(dense_routing, self.mesh_config)
+            if sparse_idx is not None:
+                sparse_idx = ccl_lane_gather_rows(sparse_idx, self.mesh_config)
+                if os.environ.get("GEMMA4_SPARSE_DEBUG") == "1":
+                    ttnn.synchronize_device(self.mesh_device)
+                    logger.info(
+                        f"[sparse-dbg] lane-gathered indices: shape={sparse_idx.shape} dtype={sparse_idx.dtype}"
+                    )
             owner = getattr(self.mesh_config, "_g4_single_lane_prefill_owner", None)
             if owner is not None and os.environ.get("GEMMA4_EP_LANE_FASTPATH", "1") != "0":
                 # Single-user prefill: only the owner lane's rows are real. Every lane still needs
@@ -132,8 +175,15 @@ class Gemma4Experts:
                 lo, hi = owner * block, (owner + 1) * block
                 hidden_owner = ttnn.slice(hidden_states, [0, 0, lo, 0], [1, 1, hi, hidden_states.shape[-1]])
                 routing_owner = ttnn.slice(dense_routing, [0, 0, lo, 0], [1, 1, hi, dense_routing.shape[-1]])
+                if sparse_idx is not None:
+                    idx_owner = ttnn.slice(sparse_idx, [0, 0, lo, 0], [1, 1, hi, sparse_idx.shape[-1]])
+                    sparse_idx.deallocate(True)
+                    routing_owner = (routing_owner, ttnn.typecast(idx_owner, ttnn.uint16))
                 hidden_states.deallocate(True)
                 dense_routing.deallocate(True)
+                # The owner block keeps the dense routing matrix: the kernel's sparse (values, indices) input is
+                # for decode frames (served A/B 2026-10-23: kernel vs dispatch for 128-token prefills within 3%).
+                assert not isinstance(routing_owner, tuple), "sparse routing only feeds the decode frames"
                 if self._use_decode_kernel(hidden_owner):
                     out = self.moe_decode.forward(hidden_owner, routing_owner)  # full sum on every chip
                 elif self._use_dispatch(hidden_owner):
@@ -149,8 +199,11 @@ class Gemma4Experts:
             elif self._use_dispatch(hidden_states) or self._use_decode_kernel(hidden_states):
                 # full sum of every lane's rows on every chip: each lane keeps its own block of rows
                 if self._use_decode_kernel(hidden_states):
+                    if sparse_idx is not None:
+                        dense_routing = (dense_routing, ttnn.typecast(sparse_idx, ttnn.uint16))
                     out = self.moe_decode.forward(hidden_states, dense_routing)
                 else:
+                    assert sparse_idx is None, "sparse routing only feeds the decode MoE kernel"
                     out = self.dispatch_experts.forward(hidden_states, dense_routing)
                 out = ttnn.mesh_partition(out, dim=2, cluster_axis=self.mesh_config.ep_axis)
             else:
@@ -160,7 +213,8 @@ class Gemma4Experts:
                 out = ttnn.slice(out, [0, 0, 0, 0], [1, 1, rows, out.shape[-1]])
             return out
         if self._use_decode_kernel(hidden_states):
-            return self.moe_decode.forward(hidden_states, dense_routing)
+            return self.moe_decode.forward(hidden_states, dense_routing)  # dense matrix or (values, indices)
+        assert not isinstance(dense_routing, tuple), "sparse routing only feeds the decode MoE kernel"
         if self._use_dispatch(hidden_states):
             return self.dispatch_experts.forward(hidden_states, dense_routing)
         return self._forward(hidden_states, dense_routing, combine=True)

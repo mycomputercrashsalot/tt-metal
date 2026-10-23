@@ -7,9 +7,12 @@
     pytest -k "1x8"   # T3K with TP-sharded experts + CCL
 """
 
+
+import pytest
 import torch
 
 import ttnn
+from models.common.utility_functions import is_blackhole
 from models.demos.gemma4.tt.moe import MoEBlock
 
 from ...tests.test_factory import (
@@ -107,3 +110,87 @@ def test_moe(batch_size, seq_len, mesh_device, reset_seeds, request):
 
     passing, pcc_msg = compare_tensors(tt_output_torch, ref_output, pcc_threshold=get_pcc_threshold(request))
     assert passing, f"MoE (tp={tp}) PCC too low: {pcc_msg}"
+
+
+@pytest.mark.skipif(not is_blackhole(), reason="the decode MoE kernel is Blackhole-only")
+@parametrize_mesh_with_fabric(
+    mesh_shapes=[(8, 4)],
+    device_params_extra={"fabric_config": ttnn.FabricConfig.FABRIC_1D_RING, "l1_small_size": 65536},
+)
+@pytest.mark.parametrize(
+    "lanes",
+    [
+        pytest.param(
+            False,
+            id="tp",
+            marks=pytest.mark.skip(reason="decode MoE kernel on the non-lane 8x4 frame hangs (not a served layout)"),
+        ),
+        pytest.param(True, id="lanes"),
+    ],
+)
+@pytest.mark.parametrize("rows", [8, 128], ids=["rows8", "rows128"])
+def test_moe_sparse_routing_matches_dense(mesh_device, lanes, rows, reset_seeds, request, monkeypatch):
+    """Decode rows through the decode MoE kernel: the router's sparse (values, indices) must give the same
+    expert sum as the dense routing matrix the kernel used to re-top-k, on the TP layout and through the lane
+    wrapper (which gathers the indices across lanes)."""
+    from models.demos.gemma4.config import MeshConfig, ModeConfig
+    from models.demos.gemma4.tt.ccl import CCLManager
+
+    monkeypatch.setenv("GEMMA4_MOE_DECODE_KERNEL", "1")
+    monkeypatch.setenv("GEMMA4_GALAXY_FRACTURE", "1")
+    monkeypatch.setenv("GEMMA4_GALAXY_LANES", "1" if lanes else "0")
+    hf_text_config = TestFactory.create_hf_text_config()  # real expert geometry: the kernel config is the 26B's
+    hf_layer = TestFactory.create_hf_reference_layer(hf_text_config, layer_idx=0)
+    with torch.no_grad():
+        hf_layer.router.proj.weight.normal_(0, 1.0)
+    state_dict = {
+        "router.scale": hf_layer.router.scale.data.clone(),
+        "router.proj.weight": hf_layer.router.proj.weight.data.clone(),
+        "router.per_expert_scale": hf_layer.router.per_expert_scale.data.clone(),
+        "experts.gate_up_proj": hf_layer.experts.gate_up_proj.data.clone(),
+        "experts.down_proj": hf_layer.experts.down_proj.data.clone(),
+    }
+    hf_config = TestFactory.create_hf_config()
+    hf_config.num_hidden_layers = 1  # the decode MoE kernel module builds once every declared layer registered
+    tp, ep = mesh_device.shape[0], mesh_device.shape[1]
+    mesh_config = MeshConfig(
+        mesh_device.shape,
+        decode=ModeConfig(tp=tp, ep=ep),
+        prefill=ModeConfig(tp=tp, ep=ep),
+        tp_axis=0,
+        weight_fracture=True,
+    )
+    moe = MoEBlock(
+        mesh_device=mesh_device,
+        hf_config=hf_config,
+        state_dict=state_dict,
+        ccl_manager=CCLManager(mesh_device, num_links=1),
+        mesh_config=mesh_config,
+        dtype=ttnn.bfloat8_b,
+    )
+    # rows: 8 = decode-like, 128 = a short single-user prefill that the kernel also takes (per lane when lanes are on)
+    x_torch = torch.randn(1, 1, rows, hf_config.hidden_size, dtype=torch.bfloat16)
+    x_tt = ttnn.from_torch(
+        x_torch,
+        device=mesh_device,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=ttnn.bfloat16,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+    )
+
+    def run(sparse):
+        monkeypatch.setenv("GEMMA4_SPARSE_ROUTING", "1" if sparse else "0")
+        assert moe.experts.wants_sparse_routing(x_tt) == sparse
+        out = moe(x_tt, x_tt)
+        return ttnn.to_torch(ttnn.get_device_tensors(out)[0]).reshape(-1, hf_config.hidden_size).float()[:rows]
+
+    # A device hang here is bounded by TT_METAL_OPERATION_TIMEOUT_SECONDS (also the per-device teardown wait);
+    # run with a short value (10 s). Never skip the mesh close: it leaves the fabric up for the next process.
+    dense = run(False)
+    print("[sparse-test] dense run done", flush=True)
+    sparse = run(True)
+    print("[sparse-test] sparse run done", flush=True)
+    assert torch.isfinite(sparse).all()
+    pcc = torch.corrcoef(torch.stack([dense.flatten(), sparse.flatten()]))[0, 1].item()
+    print(f"[lanes={lanes}] pcc(dense, sparse)={pcc:.6f} max|diff|={(dense - sparse).abs().max():.5f}")
+    assert pcc > 0.999, f"sparse routing diverges from the dense path: pcc={pcc}"

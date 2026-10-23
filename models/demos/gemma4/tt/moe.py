@@ -65,5 +65,8 @@ class MoEBlock:
         Returns:
             output: [1, 1, seq_len, hidden_size] on device
         """
+        if self.experts.wants_sparse_routing(expert_input):
+            # decode MoE kernel rows: top-k straight from the router (no dense scatter, no second top-k)
+            return self.experts(expert_input, self.router(router_input, sparse=True))
         dense_routing = self.router(router_input)
         return self.experts(expert_input, dense_routing)

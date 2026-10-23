@@ -227,7 +227,7 @@ def _rotate_half(x):
     return ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
 
-def apply_rope_decode_peruser(tensor, cos_b, sin_b):
+def apply_rope_decode_peruser(tensor, cos_b, sin_b, prepared=None):
     """Per-user decode RoPE: ``q*cos + rotate_half(q)*sin``.
 
     Batched, multi-core, and convention-matched to Gemma4's HF NeoX cos/sin
@@ -243,8 +243,15 @@ def apply_rope_decode_peruser(tensor, cos_b, sin_b):
     """
     heads = tensor.shape[2]
     if cos_b.shape[2] != heads:
-        cos_b = ttnn.repeat(cos_b, ttnn.Shape([1, 1, heads, 1]))
-        sin_b = ttnn.repeat(sin_b, ttnn.Shape([1, 1, heads, 1]))
+        # ``prepared`` (per step, per layer type) caches the head-repeated cos/sin for the layers of a type.
+        rep = prepared.get(("heads", heads)) if prepared is not None else None
+        if rep is None:
+            cos_b = ttnn.repeat(cos_b, ttnn.Shape([1, 1, heads, 1]))
+            sin_b = ttnn.repeat(sin_b, ttnn.Shape([1, 1, heads, 1]))
+            if prepared is not None:
+                prepared[("heads", heads)] = (cos_b, sin_b)
+        else:
+            cos_b, sin_b = rep
     return ttnn.add(ttnn.mul(tensor, cos_b), ttnn.mul(_rotate_half(tensor), sin_b))
 
 

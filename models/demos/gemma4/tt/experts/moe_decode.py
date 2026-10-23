@@ -99,29 +99,86 @@ class Gemma4MoEDecode:
         assert self._reg["module"] is not None, "decode MoE module not built: not every layer registered"
         return self._reg["module"]
 
+    def _pad_index_rows(self, pad):
+        """[1, 1, pad, top_k] uint16 ROW_MAJOR rows of 0..top_k-1, replicated: distinct expert ids for the
+        weight-0 frame padding of the sparse routing (cached per pad size)."""
+        cache = self.__dict__.setdefault("_pad_index_rows_cache", {})
+        if pad not in cache:
+            rows = torch.arange(self.top_k, dtype=torch.int32).repeat(pad, 1).reshape(1, 1, pad, self.top_k)
+            cache[pad] = ttnn.from_torch(
+                rows,
+                device=self.mesh_device,
+                dtype=ttnn.uint16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+        return cache[pad]
+
     def forward(self, hidden, routing):
-        """hidden [1,1,R,H] and routing [1,1,R,E] replicated on every chip, R <= frame_rows (padded here).
-        Returns [1,1,R,H] replicated: the top-k weighted expert sum."""
+        """hidden [1,1,R,H] replicated on every chip, R <= frame_rows (padded here); routing is either the dense
+        [1,1,R,E] matrix or the router's sparse ``(values [1,1,R,K] bf16, indices [1,1,R,K] uint16)``, which skip
+        the dense pad / layout / per-row top-k here. Returns [1,1,R,H] replicated: the top-k weighted expert sum."""
         R = int(hidden.shape[2])
         assert R <= self.frame_rows, f"{R} rows > frame {self.frame_rows}"
-        if R < self.frame_rows:
-            pad = self.frame_rows - R
+        sparse = isinstance(routing, tuple)
+        values, indices = routing if sparse else (routing, None)
+        pad = self.frame_rows - R
+        if pad > 0:
             hidden = ttnn.pad(hidden, [(0, 0), (0, 0), (0, pad), (0, 0)], 0.0)
-            routing = ttnn.pad(routing, [(0, 0), (0, 0), (0, pad), (0, 0)], 0.0)
+            values = ttnn.pad(values, [(0, 0), (0, 0), (0, pad), (0, 0)], 0.0)
         B = self.batch_per_device
         # Row-major before the per-row split: a slice of B < 32 rows is not tile-aligned, reshapes of uint16 tensors
         # are only views in row-major, and the gathers below must not carry tile padding between chips.
         hidden_rm = ttnn.to_layout(hidden, ttnn.ROW_MAJOR_LAYOUT)
-        routing_rm = ttnn.to_layout(routing, ttnn.ROW_MAJOR_LAYOUT)
         x = ttnn.mesh_partition(hidden_rm, dim=2, cluster_axis=0)  # [1,1,B,H] per row-chip
-        r = ttnn.mesh_partition(routing_rm, dim=2, cluster_axis=0)  # [1,1,B,E]
         ttnn.deallocate(hidden_rm)
-        ttnn.deallocate(routing_rm)
-        r = ttnn.to_layout(r, ttnn.TILE_LAYOUT)
-        scores, indices = ttnn.topk(r, k=self.top_k, dim=-1)  # [1,1,B,K] bf16 / uint16 (TILE)
-        ttnn.deallocate(r)
-        scores = ttnn.reshape(ttnn.to_layout(scores, ttnn.ROW_MAJOR_LAYOUT), (B, 1, 1, self.top_k))
-        indices = ttnn.reshape(ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT), (B, 1, 1, self.top_k))
+        if sparse:
+            dbg = os.environ.get("GEMMA4_SPARSE_DEBUG") == "1"
+            if pad > 0:
+                # Pad rows carry weight 0 but must still name DISTINCT experts per k: the dispatch kernel
+                # keys its per-token slots by expert id, and a row of eight identical ids hangs the mesh
+                # (the dense path's topk over an all-zero row yields ids 0..7 for the same reason).
+                indices = ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT)
+                indices = ttnn.concat([indices, self._pad_index_rows(pad)], dim=2)
+
+            def _ck(tag, t):
+                if dbg:
+                    ttnn.synchronize_device(self.mesh_device)
+                    logger.info(
+                        f"[sparse-dbg] {tag}: shape={t.shape} dtype={t.dtype} layout={t.layout} mem={t.memory_config()}"
+                    )
+
+            _ck("values(in)", values)
+            _ck("indices(in)", indices)
+            values_rm = ttnn.to_layout(values, ttnn.ROW_MAJOR_LAYOUT)
+            _ck("values_rm", values_rm)
+            indices_rm = (
+                indices if indices.layout == ttnn.ROW_MAJOR_LAYOUT else ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT)
+            )
+            _ck("indices_rm", indices_rm)
+            scores = ttnn.reshape(ttnn.mesh_partition(values_rm, dim=2, cluster_axis=0), (B, 1, 1, self.top_k))
+            _ck("scores", scores)
+            indices = ttnn.reshape(ttnn.mesh_partition(indices_rm, dim=2, cluster_axis=0), (B, 1, 1, self.top_k))
+            _ck("indices", indices)
+            if dbg:
+                logger.info(
+                    f"[sparse-dbg] indices host row0: {ttnn.to_torch(ttnn.get_device_tensors(indices)[0])[0, 0, 0].tolist()}"
+                )
+                logger.info(
+                    f"[sparse-dbg] scores host row0: {ttnn.to_torch(ttnn.get_device_tensors(scores)[0])[0, 0, 0].tolist()}"
+                )
+            ttnn.deallocate(values_rm)
+            ttnn.deallocate(indices_rm)
+        else:
+            routing_rm = ttnn.to_layout(values, ttnn.ROW_MAJOR_LAYOUT)
+            r = ttnn.mesh_partition(routing_rm, dim=2, cluster_axis=0)  # [1,1,B,E]
+            ttnn.deallocate(routing_rm)
+            r = ttnn.to_layout(r, ttnn.TILE_LAYOUT)
+            scores, indices = ttnn.topk(r, k=self.top_k, dim=-1)  # [1,1,B,K] bf16 / uint16 (TILE)
+            ttnn.deallocate(r)
+            scores = ttnn.reshape(ttnn.to_layout(scores, ttnn.ROW_MAJOR_LAYOUT), (B, 1, 1, self.top_k))
+            indices = ttnn.reshape(ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT), (B, 1, 1, self.top_k))
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
         x = ttnn.reshape(x, (B, 1, 1, self.hidden))
@@ -132,7 +189,12 @@ class Gemma4MoEDecode:
             os.makedirs(os.path.dirname(prefix), exist_ok=True)
             ttnn.dump_device_memory_state(self.mesh_device, prefix)
             logger.info(f"Gemma4MoEDecode: device memory state dumped to {prefix}*")
+        if sparse and os.environ.get("GEMMA4_SPARSE_DEBUG") == "1":
+            logger.info("[sparse-dbg] entering kernel forward")
         out = self.module.forward(x, scores, indices, layer_id=self.layer_idx)  # [1,1,B,H/cols] per chip
+        if sparse and os.environ.get("GEMMA4_SPARSE_DEBUG") == "1":
+            ttnn.synchronize_device(self.mesh_device)
+            logger.info("[sparse-dbg] kernel forward done")
         ttnn.deallocate(x)
         ttnn.deallocate(scores)
         ttnn.deallocate(indices)

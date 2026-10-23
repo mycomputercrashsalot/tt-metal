@@ -86,9 +86,14 @@ class Gemma4Router:
         else:
             self.per_expert_scale = None
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, sparse=False):
         """
         Route tokens to experts. Fully on-device, trace-compatible.
+
+        ``sparse=True`` returns ``(values, indices)`` of shape [1, 1, seq_len, top_k] (bf16 / uint16, TILE):
+        the sum-normalized top-k weights with the per-expert scale gathered at the selected experts, i.e. the
+        same numbers the dense [.., num_experts] matrix carries at its non-zero columns, without the scatter
+        and without the consumer re-selecting the top-k (the decode MoE kernel takes them directly).
 
         Args:
             hidden_states: [1, 1, seq_len, hidden_size] on device
@@ -119,6 +124,18 @@ class Gemma4Router:
         # divides by the sum here; a second softmax would compress the
         # distribution nonlinearly and diverge from the reference.
         top_k_sum = ttnn.sum(top_k_values, dim=-1, keepdim=True)
+        if sparse:
+            if self.per_expert_scale is not None:
+                # HF: weights = normalize(topk(probs)) * per_expert_scale[idx]; the scale is gathered at the
+                # selected experts from the scaled probabilities (same selection, same values).
+                scaled = ttnn.mul(router_probs, self.per_expert_scale)
+                top_k_values.deallocate(True)
+                top_k_values = ttnn.gather(scaled, dim=-1, index=top_k_indices)
+                scaled.deallocate(True)
+            top_k_values = ttnn.div(top_k_values, top_k_sum)
+            top_k_sum.deallocate(True)
+            router_probs.deallocate(True)
+            return top_k_values, top_k_indices
         top_k_values = ttnn.div(top_k_values, top_k_sum)
         top_k_sum.deallocate(True)
 

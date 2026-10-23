@@ -272,6 +272,7 @@ class Gemma4Attention:
         valid_seq_len=None,
         sequential_kv_write=False,
         rope_presliced=False,
+        rope_prepared=None,
         packed=None,
         chunk_start_idx=None,
         chunk_page_table=None,
@@ -347,6 +348,7 @@ class Gemma4Attention:
                 position_idx_cache=position_idx_cache,
                 sequential_kv_write=sequential_kv_write,
                 rope_presliced=rope_presliced,
+                rope_prepared=rope_prepared,
             )
         else:
             # Sliding-window layers under generator-level chunked prefill carry a

@@ -79,6 +79,7 @@ def decode_forward(
     position_idx_cache=None,
     sequential_kv_write=False,
     rope_presliced=False,
+    rope_prepared=None,
 ):
     """
     Single-token decode attention, fully on device.
@@ -157,13 +158,21 @@ def decode_forward(
         # the elementwise form; off by default until measured.
         peruser_at_b1 = os.environ.get("GEMMA4_ROPE_PERUSER_B1", "0") == "1"
         if batch > 1 or peruser_at_b1:
-            cos_b = ttnn.transpose(cos_pos, 1, 2)[:, :batch, :, :]  # [1, batch, 1, head_dim]
-            sin_b = ttnn.transpose(sin_pos, 1, 2)[:, :batch, :, :]
+            # ``rope_prepared`` (per step, per layer type, from the model) keeps the transposed/sliced cos/sin
+            # and their head-repeated forms across the layers of one type: only the first layer pays the ops.
+            base = rope_prepared.get("base") if rope_prepared is not None else None
+            if base is None:
+                cos_b = ttnn.transpose(cos_pos, 1, 2)[:, :batch, :, :]  # [1, batch, 1, head_dim]
+                sin_b = ttnn.transpose(sin_pos, 1, 2)[:, :batch, :, :]
+                if rope_prepared is not None:
+                    rope_prepared["base"] = (cos_b, sin_b)
+            else:
+                cos_b, sin_b = base
 
         def _rope(t):
             if batch == 1 and not peruser_at_b1:
                 return apply_rope(t, cos_pos, sin_pos, token_index=0)
-            return apply_rope_decode_peruser(t, cos_b, sin_b)
+            return apply_rope_decode_peruser(t, cos_b, sin_b, prepared=rope_prepared)
 
         # Rotate Q (and K, unless this is a KV-shared layer) with the shared
         # cos/sin. A concat(Q,K)->rope->split "fusion" was tried to collapse the

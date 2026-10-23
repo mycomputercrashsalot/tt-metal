@@ -1047,12 +1047,17 @@ class Gemma4Model:
                 cos_pos = ttnn.unsqueeze_to_4D(ttnn.embedding(position_idx, cos_2d, layout=ttnn.TILE_LAYOUT))
                 sin_pos = ttnn.unsqueeze_to_4D(ttnn.embedding(position_idx, sin_2d, layout=ttnn.TILE_LAYOUT))
                 decode_rope_presliced[lt] = (cos_pos, sin_pos)
+        # Per-step, per-layer-type scratch for the batch>1 RoPE: the transposed/sliced cos/sin and their
+        # head-repeated forms are built by the first layer of a type and reused by the rest (6 ops/layer
+        # fewer); freed with the presliced tensors after the loop.
+        decode_rope_prepared = {lt: {} for lt in decode_rope_presliced}
 
         # copy-mode dFlash taps index buffers per forward
         self._dflash_tap_idx = 0
         for i, layer in enumerate(self.layers):
             # Per-layer RoPE: sliding and global layers have different cos/sin
             rope_presliced = False
+            layer_rope_prepared = None
             if rope_mats is not None:
                 if isinstance(rope_mats, dict):
                     # Dict mapping layer_type -> (cos, sin) — pre-sliced for trace decode
@@ -1063,6 +1068,7 @@ class Gemma4Model:
             elif is_decode and decode_rope_presliced:
                 # Decode: use the per-layer-type cos/sin gathered once before the loop.
                 layer_rope = decode_rope_presliced[self.hf_config.layer_types[i]]
+                layer_rope_prepared = decode_rope_prepared[self.hf_config.layer_types[i]]
                 rope_presliced = True
             elif is_decode:
                 # Decode fallback: return 2D caches for on-device embedding lookup
@@ -1157,6 +1163,7 @@ class Gemma4Model:
                 valid_seq_len=prefill_valid_len,
                 sequential_kv_write=sequential_kv_write,
                 rope_presliced=rope_presliced,
+                rope_prepared=layer_rope_prepared,
                 packed=layer_packed,
                 chunk_start_idx=chunk_start_idx,
                 chunk_page_table=chunk_page_table,
@@ -1196,6 +1203,10 @@ class Gemma4Model:
         for cos_pos, sin_pos in decode_rope_presliced.values():
             cos_pos.deallocate(True)
             sin_pos.deallocate(True)
+        for prepared in decode_rope_prepared.values():
+            for pair in prepared.values():
+                for t in pair:
+                    t.deallocate(True)
 
         # Deallocate any stored shared K/V tensors
         for kv_pair in shared_kv_store.values():
