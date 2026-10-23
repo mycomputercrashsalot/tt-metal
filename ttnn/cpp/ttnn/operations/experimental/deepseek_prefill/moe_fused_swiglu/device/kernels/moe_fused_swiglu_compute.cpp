@@ -447,11 +447,7 @@ void kernel_main() {
     BINARY_ACT_INIT();
 #else
     // SiLU rides the packer thread of the root's final reduce add.
-#ifdef GELU_TANH_GLU
-    gelu_tanh_tile_init_pack();
-#else
     silu_tile_init_pack();
-#endif
 #endif
 
     CircularBuffer tilize_done(cb_tilize_done);
