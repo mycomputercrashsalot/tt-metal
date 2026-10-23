@@ -10,7 +10,9 @@ chosen experts, the fused GeGLU routed-expert kernel runs only the selected expe
 outputs back to the token's row, and the reduce sums the top-k and reduce-scatters over the columns. Two
 all-gathers restore the replicated [tokens, hidden] layout the lane wrapper expects.
 
-Enabled with GEMMA4_MOE_DISPATCH_PREFILL=1 (see experts/__init__.py).
+Enabled with GEMMA4_MOE_DISPATCH_PREFILL=1 (see experts/__init__.py). The experts run on the model-local GeGLU op
+(custom_ops/geglu_routed_expert, a ttnn.generic_op) over TtRoutedExpert's weights, buffers and index table;
+TtRoutedExpert itself only loads and caches the weights, its fused op never runs here.
 """
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ from models.demos.deepseek_v3_d_p.tt.moe.tt_combine import TtCombineModule
 from models.demos.deepseek_v3_d_p.tt.moe.tt_dispatch import TtDispatchModule
 from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_routing_setup import TtMoERoutingSetup
 from models.demos.deepseek_v3_d_p.tt.moe.tt_routed_expert import TtRoutedExpert
+from models.demos.gemma4.custom_ops.geglu_routed_expert import GegluRoutedExpert
 from models.demos.minimax_m3.tt.moe.tt_reduce import TtMiniMaxReduce
 
 # tokens per dispatch chunk across the whole mesh (rows * seq_len_per_chip); every chip holds the chunk
@@ -138,8 +141,20 @@ class Gemma4DispatchExperts:
             weights_dtype=weights_dtype,
             weight_cache_path=Path(tensor_cache_path) if tensor_cache_path else None,  # the loader joins with '/'
             cache_name_prefix=f"layer_{layer_idx}.dispatch_experts",
-            activation=ttnn.RoutedExpertActivation.GeluTanhGlu,
+            # Weight loader and cache only: the GeGLU op below runs the experts, so TtRoutedExpert's own
+            # fused op (and its activation) never executes; Silu is the value the shared op validates.
+            activation=ttnn.RoutedExpertActivation.Silu,
             hybrid_token_threshold=None,
+        )
+        # The Gemma 4 model-local GeGLU routed-expert op (custom_ops/geglu_routed_expert) on TtRoutedExpert's
+        # ND-sharded bf4 weights and index table.
+        self.geglu_op = GegluRoutedExpert(
+            mesh_device,
+            self.routed_expert.gate_projs,
+            self.routed_expert.up_projs,
+            self.routed_expert.down_projs,
+            global_idx,
+            max_tokens=max_tok,
         )
         self.reduce = TtMiniMaxReduce(
             mesh_device=mesh_device, topk_dim=3, cluster_axis=self.rep_axis, num_links=num_links, topology=topology
@@ -249,7 +264,7 @@ class Gemma4DispatchExperts:
         )
         ttnn.deallocate(x_rm)
         ttnn.deallocate(offsets)
-        expert_out = self.routed_expert(ttnn.squeeze(ttnn.squeeze(buffer, dim=0), dim=0), counts, region_offsets)
+        expert_out = self.geglu_op(ttnn.squeeze(ttnn.squeeze(buffer, dim=0), dim=0), counts, region_offsets)
         ttnn.deallocate(buffer)
         expert_out = ttnn.unsqueeze(ttnn.unsqueeze(expert_out, dim=0), dim=0)
         combined = self.combine(expert_out, metadata, counts, region_offsets)  # [1,1,S,K,H] row-major

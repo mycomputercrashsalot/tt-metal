@@ -76,7 +76,7 @@ class Gemma4Experts:
         self.dispatch_min_tokens = int(os.environ.get("GEMMA4_MOE_DISPATCH_MIN_TOKENS", "256"))
         is_mesh = hasattr(mesh_device, "shape")
         if os.environ.get("GEMMA4_MOE_DISPATCH_PREFILL", "0") == "1" and is_mesh and mesh_device.get_num_devices() > 1:
-            # imported here: the DeepSeek stack needs the GeluTanhGlu ttnn build, which the default path does not
+            # imported here: the DeepSeek dispatch/combine stack is only needed on this path
             from models.demos.gemma4.tt.experts.dispatch_prefill import Gemma4DispatchExperts
 
             placeholder = bool(getattr(state_dict, "is_placeholder", False))
