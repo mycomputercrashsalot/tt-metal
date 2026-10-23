@@ -94,7 +94,12 @@ class Gemma4MoEDecode:
         gate = torch.stack([gu[:, :I, :].to(torch.bfloat16).transpose(1, 2).contiguous() for gu, _ in layers], dim=0)
         up = torch.stack([gu[:, I:, :].to(torch.bfloat16).transpose(1, 2).contiguous() for gu, _ in layers], dim=0)
         down = torch.stack([d.to(torch.bfloat16).transpose(1, 2).contiguous() for _, d in layers], dim=0)
-        reg["module"] = TTMoEDecode(self.mesh_device, tt_config, gate, up, down)
+        if os.environ.get("GEMMA4_MOE_COMPUTE_CUSTOM_OP", "0") == "1":
+            # custom_ops/moe_compute: per-expert resident weights + the standalone fabric combine (README there)
+            from models.demos.gemma4.custom_ops.moe_compute.moe_decode_custom import TTMoEDecodeCustom as _MoECls
+        else:
+            _MoECls = TTMoEDecode
+        reg["module"] = _MoECls(self.mesh_device, tt_config, gate, up, down)
         reg["config"] = tt_config
         reg["layers"].clear()
         logger.info(
