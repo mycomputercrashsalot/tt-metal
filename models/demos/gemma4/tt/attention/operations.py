@@ -22,9 +22,17 @@ from loguru import logger
 
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
+from models.demos.gemma4.tt.decode_matmul import DecodeLinear
 from models.demos.gemma4.tt.dram_sharded import DramShardedLinear
 
 from .weights import AttentionWeights
+
+# GEMMA4_HEAD_NORM_4D=1: decode per-head RMSNorm straight on the [1, batch, heads, head_dim] head tensor.
+# The flatten to [1, 1, batch*heads, head_dim] and back are two ReshapeView programs per tensor (the heads
+# dim is padded to a tile, so neither is a view): 6 programs per layer, ~1.7 ms of a batch-32 step.
+# rms_norm normalizes the last dim per row either way; measured bit-identical (P150, trace replay:
+# q/k/v norms 22-41 us -> 7-13 us each). Prefill shapes keep the flatten.
+_HEAD_NORM_4D = os.environ.get("GEMMA4_HEAD_NORM_4D", "0") == "1"
 
 # Non-chunked prefill SDPA silently returns WRONG results once the Q sequence
 # exceeds 32768 (2^15) — generation degrades to garbage. Above this length we
@@ -77,6 +85,8 @@ def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config
     """
     if isinstance(weights.wqkv, DramShardedLinear):
         return weights.wqkv(hidden_states, out_memory_config=memory_config)
+    if isinstance(weights.wqkv, DecodeLinear):
+        return weights.wqkv(hidden_states, memory_config=memory_config)
     return ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
 
 
@@ -143,7 +153,11 @@ def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None
     """
     orig_shape = tensor.shape
     head_dim = orig_shape[-1]
-    if len(orig_shape) == 4 and orig_shape[0] > 1:
+    # Decode head tensor [1, batch, heads, head_dim]: normalize in place of the flatten (see _HEAD_NORM_4D).
+    direct_4d = _HEAD_NORM_4D and len(orig_shape) == 4 and orig_shape[0] == 1 and orig_shape[2] <= ttnn.TILE_SIZE
+    if direct_4d:
+        flat = tensor
+    elif len(orig_shape) == 4 and orig_shape[0] > 1:
         batch, num_heads, seq_len, _ = orig_shape
         flat = ttnn.reshape(tensor, (1, 1, batch * num_heads * seq_len, head_dim))
     else:
@@ -180,6 +194,8 @@ def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None
             compute_kernel_config=compute_kernel_config,
         )
 
+    if direct_4d:
+        return normed
     return ttnn.reshape(normed, orig_shape)
 
 
@@ -683,7 +699,7 @@ def concat_heads(
 
 def apply_output_projection(tensor, weights: AttentionWeights):
     """Apply output projection (no bias for Gemma4)."""
-    if isinstance(weights.o_proj, DramShardedLinear):
+    if isinstance(weights.o_proj, (DramShardedLinear, DecodeLinear)):
         out = weights.o_proj(tensor)
     else:
         out = ttnn.linear(tensor, weights.o_proj)

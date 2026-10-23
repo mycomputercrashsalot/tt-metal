@@ -26,6 +26,7 @@ from models.demos.gemma4.tt.ccl import (
     ccl_lane_scatter_rows,
 )
 from models.demos.gemma4.tt.compute_config import gelu_variant
+from models.demos.gemma4.tt.decode_matmul import DecodeLinear, flag
 from models.demos.gemma4.tt.dram_sharded import TILE_SIZE, DramShardedLinear, can_dram_shard
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
@@ -34,6 +35,11 @@ from models.demos.gemma4.utils.general_utils import get_cache_file_name
 # interleaved one, so there is no memory cost. Set GEMMA4_MLP_DRAM_SHARD=0 to
 # fall back to plain interleaved matmuls.
 _DRAM_SHARD_MLP = os.environ.get("GEMMA4_MLP_DRAM_SHARD", "1") != "0"
+# GEMMA4_MLP_DECODE_1D=1: explicit 1D-multicast decode configs on the interleaved gate_up / down matmuls (the
+# MoE path): gate_up streams K in 8-tile blocks, down takes its whole K (<=32 tiles) in one block. Measured on
+# a P150 (26B-A4B TP=4, trace replay): gate_up 43 -> 19 us, down 25 -> 16 us, same HiFi2 numerics.
+_MLP_GATE_UP_BLOCK_W = 8
+_MLP_DOWN_BLOCK_W = 32
 
 
 def resolve_shared_mlp_intermediate_size(hf_config, state_dict=None, layer_idx=None) -> int:
@@ -176,6 +182,7 @@ class SharedMLP:
         # for MoE; dense 12B/31B retain the sharded opt.
         is_moe = bool(getattr(hf_config, "enable_moe_block", False))
         dram_shard = _DRAM_SHARD_MLP and tp > 1 and not is_moe and not fractured
+        decode_1d = flag("GEMMA4_MLP_DECODE_1D")
 
         if dram_shard and can_dram_shard(self.hidden_size, gu_n, dtype=dtype):
             self.gate_up_proj = DramShardedLinear(
@@ -202,7 +209,14 @@ class SharedMLP:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
-            self.gate_up_proj = lambda x: ttnn.linear(x, gate_up_proj)
+            self.gate_up_proj = DecodeLinear(
+                gate_up_proj,
+                mesh_device,
+                k=self.hidden_size,
+                n=gu_n,
+                enabled=decode_1d,
+                max_block_w=_MLP_GATE_UP_BLOCK_W,
+            )
 
         if dram_shard and can_dram_shard(down_k, self.hidden_size, dtype=dtype):
             self.down_proj = DramShardedLinear(
@@ -229,7 +243,9 @@ class SharedMLP:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
-            self.down_proj = lambda x: ttnn.linear(x, down_proj)
+            self.down_proj = DecodeLinear(
+                down_proj, mesh_device, k=down_k, n=self.hidden_size, enabled=decode_1d, max_block_w=_MLP_DOWN_BLOCK_W
+            )
 
     def __call__(self, hidden_states):
         """

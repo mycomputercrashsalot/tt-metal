@@ -11,9 +11,17 @@ top-k weights linearly (NOT a second softmax — that would diverge from HF).
 
 
 import ttnn
+from models.demos.gemma4.tt.decode_matmul import DecodeLinear, flag, is_decode_rows
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
+
+# GEMMA4_ROUTER_DECODE_1D=1: explicit 1D-multicast decode config on the router projection (N = num_experts is
+# 4 tiles, so the auto config runs 4 cores with a 2-tile K block: 36 us for a 0.7 MB weight on the 26B-A4B);
+# a 22-tile K block takes it to 10 us (P150, trace replay), same HiFi2 numerics.
+_ROUTER_DECODE_BLOCK_W = 22
+# GEMMA4_ROUTER_FOLD_SCALE=1: decode rows apply HF's ``norm(x) * scale * hidden**-0.5`` as one rms_norm with
+# the folded weight (3 programs -> 1 per layer). Prefill keeps the fp32 norm + two multiplies.
 
 
 class Gemma4Router:
@@ -71,6 +79,21 @@ class Gemma4Router:
             cache_file_name=get_cache_file_name(tensor_cache_path, f"proj.weight{dtype_suffix}"),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        self.proj = DecodeLinear(
+            self.proj_weight,
+            mesh_device,
+            k=self.hidden_size,
+            n=self.num_experts,
+            enabled=flag("GEMMA4_ROUTER_DECODE_1D"),
+            max_block_w=_ROUTER_DECODE_BLOCK_W,
+        )
+
+        # Folded decode norm gamma: scale * hidden**-0.5, derived ON DEVICE from the cached ``scale`` (a warm
+        # tensor cache hands this constructor dataless placeholders, so a host-side product would be
+        # persisted as zeros under a new cache name). TILE [1, 1, 1, H] is a valid rms_norm gamma layout.
+        self.scale_folded = None
+        if flag("GEMMA4_ROUTER_FOLD_SCALE"):
+            self.scale_folded = ttnn.multiply(self.scale, self.scalar_root_size)
 
         # Per-expert scale on device [1, 1, 1, num_experts] for broadcast mul with dense routing
         if per_expert_scale_raw is not None:
@@ -101,16 +124,20 @@ class Gemma4Router:
         Returns:
             dense_routing: [1, 1, seq_len, num_experts] on device — weights at selected experts, zeros elsewhere
         """
-        # 1. RMSNorm — on device
-        normed = self.norm.forward(hidden_states)
+        if self.scale_folded is not None and is_decode_rows(hidden_states):
+            # 1+2. RMSNorm with the folded scale * hidden**-0.5 gamma (decode rows; see _ROUTER fold note)
+            scaled = ttnn.rms_norm(hidden_states, weight=self.scale_folded, epsilon=self.norm.eps)
+        else:
+            # 1. RMSNorm — on device
+            normed = self.norm.forward(hidden_states)
 
-        # 2. Scale — on device
-        scaled = ttnn.mul(normed, self.scale)
-        normed.deallocate(True)
-        scaled = ttnn.mul(scaled, self.scalar_root_size)
+            # 2. Scale — on device
+            scaled = ttnn.mul(normed, self.scale)
+            normed.deallocate(True)
+            scaled = ttnn.mul(scaled, self.scalar_root_size)
 
         # 3. Linear projection → [1, 1, seq_len, num_experts] — on device
-        expert_scores = ttnn.linear(scaled, self.proj_weight)
+        expert_scores = self.proj(scaled)
         scaled.deallocate(True)
 
         # 4. Softmax over all experts — on device
