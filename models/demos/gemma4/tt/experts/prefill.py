@@ -18,7 +18,7 @@ import torch
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 
-from .decode import _build_sparse_matmul_config
+from .decode import _build_sparse_matmul_config, _decode_sparse_matmul_knobs
 from .operations import apply_geglu
 from .weights import ExpertWeights
 
@@ -98,11 +98,35 @@ def _process_prefill_chunk(hidden_states, routing_weights, weights: ExpertWeight
     tile_mask = ttnn.to_layout(tile_mask, ttnn.ROW_MAJOR_LAYOUT)
     sparsity = ttnn.reshape(tile_mask, (1, 1, group_size, num_local))
     output_tile = ttnn.Tile([32, 32])
-    gate_up_config = _build_sparse_matmul_config(TILE_SIZE, 2 * intermediate)
-    down_config = _build_sparse_matmul_config(chunk_len, hidden_size)
+    math_fidelity = ttnn.MathFidelity.HiFi4
+    # Decode frames (a batched decode step of up to 32 users lands here with chunk_len == 32) take the same
+    # GEMMA4_SPARSE_MM_* program-config knobs as the batch-1 path in decode.py; all unset -> the shipped configs.
+    knobs = _decode_sparse_matmul_knobs(hidden_grouped.device()) if chunk_len <= TILE_SIZE else None
+    if knobs is not None and (knobs["max_grid"] is not None or knobs["in0_block_w"] > 1 or knobs["out_subblock_w"] > 1):
+        gate_up_config = _build_sparse_matmul_config(
+            TILE_SIZE,
+            2 * intermediate,
+            in0_block_w=knobs["in0_block_w"],
+            max_grid=knobs["max_grid"],
+            k=hidden_size,
+            out_subblock_w=knobs["out_subblock_w"],
+        )
+        down_config = _build_sparse_matmul_config(
+            chunk_len,
+            hidden_size,
+            in0_block_w=knobs["in0_block_w"],
+            max_grid=knobs["max_grid"],
+            k=intermediate,
+            out_subblock_w=knobs["out_subblock_w"],
+        )
+    else:
+        gate_up_config = _build_sparse_matmul_config(TILE_SIZE, 2 * intermediate)
+        down_config = _build_sparse_matmul_config(chunk_len, hidden_size)
+    if knobs is not None and knobs["fidelity"] is not None:
+        math_fidelity = knobs["fidelity"]
     expert_compute_kernel_config = ttnn.init_device_compute_kernel_config(
         hidden_grouped.device().arch(),
-        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_fidelity=math_fidelity,
         math_approx_mode=False,
         fp32_dest_acc_en=False,
         packer_l1_acc=False,
@@ -123,11 +147,16 @@ def _process_prefill_chunk(hidden_states, routing_weights, weights: ExpertWeight
     down_input = apply_geglu_fused(up_gate)
     up_gate.deallocate(True)
     down_input = ttnn.reshape(down_input, (1, num_local, chunk_len, intermediate))
+    # Decode frames with GEMMA4_MOE_FRAME_SPARSE_DOWN=1: the down projection skips the experts no user of the
+    # frame routes to (the same [1,1,1,E_loc] tile mask the up/gate projection uses, nnz inferred) instead of
+    # computing all E_loc experts and zeroing them through the routing weights below. Off by default: real
+    # prefill chunks (group_size > 1) keep the dense down projection.
+    sparse_down = chunk_len <= TILE_SIZE and os.environ.get("GEMMA4_MOE_FRAME_SPARSE_DOWN", "0") == "1"
     down = ttnn.sparse_matmul(
         down_input,
         weights.down_proj,
-        sparsity=prefill_sparsity,
-        nnz=num_local,
+        sparsity=sparsity if sparse_down else prefill_sparsity,
+        nnz=None if sparse_down else num_local,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         output_tile=output_tile,
         program_config=down_config,

@@ -19,6 +19,7 @@ step against the DRAM-bandwidth floor.
 
 import json
 import os
+import time
 
 import pytest
 import torch
@@ -106,6 +107,13 @@ def test_decode_roofline(mesh_device, model_path, batch_size):
 
     prompt = tokenizer.encode("It was the best of times, it was the worst of times, " * 12, add_special_tokens=True)
     tokens = torch.tensor(prompt[:PREFILL_LEN]).unsqueeze(0).repeat(batch_size, 1)
+    if os.environ.get("GEMMA4_ROOFLINE_DISTINCT_ROWS", "0") == "1" and batch_size > 1:
+        # Distinct random prompts per user: with the same prompt on every row all users route to the same
+        # top-k, so a batch-32 step reads ~8 experts per layer instead of the ~100 a served batch touches
+        # (the MoE weight traffic is then 10x under-represented). Seeded for run-to-run comparability.
+        gen = torch.Generator().manual_seed(1234)
+        tokens = torch.randint(1000, 200000, (batch_size, PREFILL_LEN), generator=gen)
+        tokens[:, 0] = prompt[0]  # keep the BOS token
     out = generator.prefill_forward_text(
         tokens,
         page_table=page_table,
@@ -164,14 +172,23 @@ def test_decode_roofline(mesh_device, model_path, batch_size):
         except Exception:
             pass
 
+    profiler_on = os.environ.get("TT_METAL_DEVICE_PROFILER") == "1"
     _flush()
     _signpost("start")
+    t0 = time.perf_counter()
     for _ in range(N_STEPS):
         tok = step(tok)
         current_pos += 1
         ttnn.synchronize_device(mesh_device)
-        _flush()
+        if profiler_on:
+            _flush()
+    wall_ms = (time.perf_counter() - t0) / N_STEPS * 1e3
     _signpost("stop")
+    # Host wall time per step (synchronized): the serving-relevant number when traced and the profiler is off.
+    logger.info(
+        f"WALL batch={batch_size} {'traced' if TRACED else 'eager'}: {wall_ms:.2f} ms/step = "
+        f"{1e3 / wall_ms:.2f} tok/s/user, {batch_size * 1e3 / wall_ms:.1f} tok/s aggregate ({N_STEPS} steps)"
+    )
     try:
         ttnn.ReadDeviceProfiler(mesh_device)
     except Exception:  # profiler off: nothing to flush

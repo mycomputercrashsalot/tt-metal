@@ -9,6 +9,7 @@ sparse_matmul output is 6D: [batch_dims..., num_experts, seq_tiles, n_dim].
 """
 
 import math
+import os
 
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
@@ -16,31 +17,87 @@ from models.demos.gemma4.tt.ccl import ccl_allreduce
 from .weights import ExpertWeights
 
 
-def _build_sparse_matmul_config(m, n, in0_block_w=1):
-    """Build program config for sparse_matmul following gpt-oss pattern."""
-    n_tiles = int(math.ceil(n / 32))
+def _decode_sparse_matmul_knobs(mesh_device=None):
+    """Env knobs for the DECODE sparse_matmul program configs (all default to the shipped values).
 
-    # Find largest divisor of n_tiles fitting in 8×8 grid
+    ``GEMMA4_SPARSE_MM_GRID=13x10`` lets the core grid use the whole Blackhole compute grid instead of the 8x8 the
+    builder assumes (the 26B gate_up N=1408 -> 44 tiles only fits 4 cores in 8x8 but 11x4 in 13x10; down N=2816 ->
+    88 tiles: 8 cores vs 11x8), ``GEMMA4_SPARSE_MM_IN0_BLOCK_W`` the K block (snapped to a divisor of Kt),
+    ``GEMMA4_SPARSE_MM_OUT_SUBBLOCK_W`` the output subblock width (snapped to a divisor of per_core_N) and
+    ``GEMMA4_SPARSE_MM_FIDELITY=lofi|hifi2|hifi3|hifi4`` the compute fidelity (unset: the op default). ``device``
+    caps the grid at the device's compute grid.
+    """
+    grid = None
+    env_grid = os.environ.get("GEMMA4_SPARSE_MM_GRID", "")
+    if env_grid:
+        if env_grid.lower() in ("device", "full", "max") and mesh_device is not None:
+            g = mesh_device.compute_with_storage_grid_size()
+            grid = (int(g.x), int(g.y))
+        else:
+            gx, gy = env_grid.lower().split("x")
+            grid = (int(gx), int(gy))
+        if mesh_device is not None:
+            g = mesh_device.compute_with_storage_grid_size()
+            grid = (min(grid[0], int(g.x)), min(grid[1], int(g.y)))
+    fidelity = None
+    env_fid = os.environ.get("GEMMA4_SPARSE_MM_FIDELITY", "").lower()
+    if env_fid:
+        fidelity = {
+            "lofi": ttnn.MathFidelity.LoFi,
+            "hifi2": ttnn.MathFidelity.HiFi2,
+            "hifi3": ttnn.MathFidelity.HiFi3,
+            "hifi4": ttnn.MathFidelity.HiFi4,
+        }[env_fid]
+    return {
+        "max_grid": grid,
+        "in0_block_w": max(1, int(os.environ.get("GEMMA4_SPARSE_MM_IN0_BLOCK_W", "1"))),
+        "out_subblock_w": max(1, int(os.environ.get("GEMMA4_SPARSE_MM_OUT_SUBBLOCK_W", "1"))),
+        "fidelity": fidelity,
+    }
+
+
+def _largest_divisor_at_most(n, cap):
+    for d in range(min(n, cap), 0, -1):
+        if n % d == 0:
+            return d
+    return 1
+
+
+def _build_sparse_matmul_config(m, n, in0_block_w=1, max_grid=None, k=None, out_subblock_w=1):
+    """Build program config for sparse_matmul following gpt-oss pattern.
+
+    ``max_grid`` (cx, cy) bounds the core rectangle (default the 8x8 the original builder assumed); the largest
+    core count dividing the N tiles that fits the rectangle is used, so every core owns ``per_core_N`` output
+    tiles and loops over the experts. ``k`` snaps ``in0_block_w`` to a divisor of the K tiles.
+    """
+    n_tiles = int(math.ceil(n / 32))
+    max_cx, max_cy = max_grid if max_grid is not None else (8, 8)
+
+    # Find largest divisor of n_tiles fitting in the max_cx x max_cy grid
     best_cores = 1
     best_cx, best_cy = 1, 1
-    for num_cores in range(1, min(65, n_tiles + 1)):
+    for num_cores in range(1, min(max_cx * max_cy, n_tiles) + 1):
         if n_tiles % num_cores != 0:
             continue
-        for cy in range(1, 9):
+        for cy in range(1, max_cy + 1):
             if num_cores % cy == 0:
                 cx = num_cores // cy
-                if cx <= 8 and num_cores > best_cores:
+                if cx <= max_cx and num_cores > best_cores:
                     best_cores = num_cores
                     best_cx, best_cy = cx, cy
                     break
 
     per_core_N = n_tiles // best_cores
+    if k is not None:
+        in0_block_w = _largest_divisor_at_most(int(math.ceil(k / 32)), in0_block_w)
+    # dst register file: out_subblock_h (1) * out_subblock_w <= 8; the subblock must divide per_core_N
+    out_subblock_w = _largest_divisor_at_most(per_core_N, min(out_subblock_w, 8))
 
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(best_cx, best_cy),
         in0_block_w=in0_block_w,
         out_subblock_h=1,
-        out_subblock_w=1,
+        out_subblock_w=out_subblock_w,
         out_block_h=1,
         out_block_w=per_core_N,
         per_core_M=max(32, m) // 32,
@@ -92,8 +149,32 @@ def decode_forward(
     if sparsity_src is not local_routing:
         sparsity_src.deallocate(True)
     output_tile = ttnn.Tile([32, 32])
-    gate_up_config = _build_sparse_matmul_config(batch_size, 2 * intermediate_size)
-    down_config = _build_sparse_matmul_config(batch_size, hidden_size)
+    knobs = _decode_sparse_matmul_knobs(mesh_device)
+    gate_up_config = _build_sparse_matmul_config(
+        batch_size,
+        2 * intermediate_size,
+        in0_block_w=knobs["in0_block_w"],
+        max_grid=knobs["max_grid"],
+        k=hidden_size,
+        out_subblock_w=knobs["out_subblock_w"],
+    )
+    down_config = _build_sparse_matmul_config(
+        batch_size,
+        hidden_size,
+        in0_block_w=knobs["in0_block_w"],
+        max_grid=knobs["max_grid"],
+        k=intermediate_size,
+        out_subblock_w=knobs["out_subblock_w"],
+    )
+    compute_kernel_config = None
+    if knobs["fidelity"] is not None:
+        compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            hidden_states.device().arch(),
+            math_fidelity=knobs["fidelity"],
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        )
     # [1,1,B,H] x [1,E_loc,H,2I] -> [1,1,1,E_loc,B_tile,2I]
     up_gate = ttnn.sparse_matmul(
         hidden_states,
@@ -103,6 +184,7 @@ def decode_forward(
         memory_config=ttnn.L1_MEMORY_CONFIG,
         output_tile=output_tile,
         program_config=gate_up_config,
+        compute_kernel_config=compute_kernel_config,
         dtype=ttnn.bfloat16,
     )
     sm_n = up_gate.shape[-1]
@@ -119,6 +201,7 @@ def decode_forward(
         output_tile=output_tile,
         program_config=down_config,
         is_input_a_sparse=True,
+        compute_kernel_config=compute_kernel_config,
         dtype=ttnn.bfloat16,
     )
     down_input.deallocate(True)

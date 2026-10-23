@@ -168,4 +168,18 @@ class Gemma4Precision:
                     f"{model_key}; downgrading {detail} bfp8 -> bf16 (bfp8 degenerates at very long "
                     "context). Costs memory/throughput; set GEMMA4_BFP8_MAX_CONTEXT=0 to disable."
                 )
+        # Per-module env override (``GEMMA4_PRECISION_EXPERTS=bfp8``, ``GEMMA4_PRECISION_ATTENTION=bf16``, ...):
+        # applied last, so it wins over the table and the context ceiling. Unset -> no change. The value lands
+        # in the cache identity and the tensorbin filenames like a table entry, so a flipped module never reuses
+        # a cache file of another precision.
+        for mod in KNOWN_MODULES:
+            env_val = os.environ.get(f"GEMMA4_PRECISION_{mod.upper()}", "").strip().lower()
+            if not env_val:
+                continue
+            if env_val not in _DTYPE_BY_NAME:
+                raise ValueError(
+                    f"GEMMA4_PRECISION_{mod.upper()}={env_val!r}: unknown dtype; expected one of {sorted(_DTYPE_BY_NAME)}"
+                )
+            resolved[mod] = _DTYPE_BY_NAME[env_val]
+            logger.info(f"Gemma4 precision: {mod} -> {env_val} (GEMMA4_PRECISION_{mod.upper()})")
         return cls(resolved)
