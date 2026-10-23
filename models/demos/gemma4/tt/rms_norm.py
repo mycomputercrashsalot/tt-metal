@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 from torch import nn
 
 import ttnn
@@ -125,8 +127,9 @@ class RMSNorm(nn.Module):
                 inplace=False,
             )
 
+            tp_axis = int(getattr(self.mesh_config, "tp_axis", 1))
             tt_gathered_stats_memory_config = ttnn.create_sharded_memory_config(
-                shape=[1, 1, 32, 32 * self.mesh_shape[1]],
+                shape=[1, 1, 32, 32 * int(self.mesh_config.mesh_shape[tp_axis])],
                 core_grid=ttnn.CoreGrid(y=1, x=1),
                 strategy=ttnn.ShardStrategy.WIDTH,
                 orientation=ttnn.ShardOrientation.ROW_MAJOR,
@@ -137,7 +140,7 @@ class RMSNorm(nn.Module):
             tt_gathered_stats = ttnn.all_gather(
                 tt_stats,
                 dim=3,
-                cluster_axis=1,
+                cluster_axis=tp_axis,
                 memory_config=tt_gathered_stats_memory_config,
             )
             ttnn.deallocate(tt_stats)
@@ -159,6 +162,20 @@ class RMSNorm(nn.Module):
             # Prefill (height > 32) and the no-weight per-head norms keep the
             # plain path. Sharded config is dim-specific, so rebuild if the
             # activation width ever changes.
+            if (
+                self.with_scale
+                and self.tt_weight is not None
+                and len(x.shape) == 4
+                and 1 <= x.shape[-2] <= ttnn.TILE_SIZE
+                and not x.is_sharded()
+                and x.shape[-1] % ttnn.TILE_SIZE == 0
+                and os.environ.get("GEMMA4_NORM_FUSED", "0") == "1"
+            ):
+                # GEMMA4_NORM_FUSED=1: one multi-core program on the interleaved rows (custom_ops/rms_norm_decode)
+                # instead of the interleaved -> width-sharded -> rms_norm -> interleaved triple below.
+                from models.demos.gemma4.custom_ops.rms_norm_decode import RmsNormDecode
+
+                return RmsNormDecode.op(x, self.tt_weight_tile, self.eps)
             if (
                 self.with_scale
                 and self.tt_weight is not None

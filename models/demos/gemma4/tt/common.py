@@ -23,7 +23,7 @@ from models.common.weight_cache import (
 )
 from models.demos.gemma4.config import MeshConfig, ModeConfig
 from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
-from models.demos.gemma4.tt.ccl import CCLManager
+from models.demos.gemma4.tt.ccl import CCLManager, mesh_tp_axis
 from models.demos.gemma4.tt.model import Gemma4Model
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs, Gemma4ModelArgs
 from models.demos.gemma4.tt.precision import Gemma4Precision
@@ -183,12 +183,28 @@ def create_tt_model(
                 logger.warning("GEMMA4_CP_PREFILL ignored: incompatible with GEMMA4_GALAXY_LANES (owner-lane KV)")
                 mesh_config.cp_prefill = False
         elif is_mesh and num_devices > 1:
-            _ep = _moe_expert_parallel(hf_text_config, tuple(mesh_device.shape), 1)
+            # Plain TP over one mesh axis (GEMMA4_TP_AXIS, default the columns); the other axis is EP. On a
+            # column mesh (the 4-chip line opened as MeshShape(4, 1)) GEMMA4_TP_AXIS=0 puts the TP group on
+            # the rows, where the token-dispatch prefill's dispatch/combine ops can run (they need axis 0).
+            _tp_axis = mesh_tp_axis()
+            _tp = int(mesh_device.shape[_tp_axis])
+            _ep = _moe_expert_parallel(hf_text_config, tuple(mesh_device.shape), _tp_axis)
             mesh_config = MeshConfig(
                 mesh_device.shape,
-                decode=ModeConfig(tp=mesh_device.shape[1], ep=_ep),
-                prefill=ModeConfig(tp=mesh_device.shape[1], ep=_ep),
+                decode=ModeConfig(tp=_tp, ep=_ep),
+                prefill=ModeConfig(tp=_tp, ep=_ep),
+                tp_axis=_tp_axis,
             )
+            if _tp_axis == 0:
+                logger.info(
+                    f"Gemma4 mesh {tuple(mesh_device.shape)}: TP={_tp} over mesh axis 0 (GEMMA4_TP_AXIS=0), EP={_ep}"
+                )
+            elif int(mesh_device.shape[1]) == 1:
+                logger.warning(
+                    f"Gemma4 mesh {tuple(mesh_device.shape)} is a column mesh but the TP group is on axis 1: "
+                    f"TP={_tp}, EP={_ep} (the dense weights are replicated on every chip); set GEMMA4_TP_AXIS=0 "
+                    "for TP over the rows"
+                )
         else:
             mesh_config = MeshConfig((1, 1), decode=ModeConfig(tp=1))
 

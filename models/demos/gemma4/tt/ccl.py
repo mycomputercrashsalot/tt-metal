@@ -9,6 +9,24 @@ import ttnn
 from models.common.utility_functions import is_blackhole
 
 
+def mesh_tp_axis() -> int:
+    """Mesh axis of the plain (non-fractured) tensor-parallel group: ``GEMMA4_TP_AXIS`` (default 1, the columns).
+
+    ``GEMMA4_TP_AXIS=0`` runs the dense TP over the mesh rows, which is what a column mesh such as the 4-chip
+    line opened as ``MeshShape(4, 1)`` needs: the DeepSeek token-dispatch / combine ops only run along mesh
+    axis 0, so a (4,1) mesh with the TP group on axis 0 can dispatch its routed-expert prefill while the
+    (1,4) orientation cannot. The Galaxy fracture path picks its own axis and ignores this knob.
+    """
+    return 0 if os.environ.get("GEMMA4_TP_AXIS", "1").strip() == "0" else 1
+
+
+def mesh_tp(mesh_device) -> int:
+    """Dense TP width of ``mesh_device`` under ``mesh_tp_axis()`` (1 on a single device)."""
+    if not hasattr(mesh_device, "shape"):
+        return 1
+    return int(mesh_device.shape[mesh_tp_axis()])
+
+
 def default_num_links():
     """Default TP-collective link count for the current arch.
 

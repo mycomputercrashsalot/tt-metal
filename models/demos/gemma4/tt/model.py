@@ -630,7 +630,10 @@ class Gemma4Model:
         if _fractured:
             self.sampling_dp = mesh_config.lanes if _lanes_on else 1
         else:
-            self.sampling_dp = mesh_device.shape[0] if is_mesh else 1
+            # The non-TP axis counts the sampling groups (the rows under the default column TP; the columns
+            # when GEMMA4_TP_AXIS=0 puts the TP group on the rows, e.g. the 4-chip line as MeshShape(4, 1)).
+            _dp_axis = 1 - int(getattr(mesh_config, "tp_axis", 1)) if mesh_config is not None else 0
+            self.sampling_dp = mesh_device.shape[_dp_axis] if is_mesh else 1
 
         # dFlash residual-tap capture (armed by dflash_capture_taps; consumed by
         # the dFlash drafter — see tt/dflash_drafter.py).
@@ -767,9 +770,11 @@ class Gemma4Model:
             args.sampling_all_gather_axis = mesh_config.tp_axis
             args.sampling_dp = mesh_config.lanes if getattr(mesh_config, "lane_sharded", False) else 1
         else:
-            args.sampling_all_gather_axis = 1  # gather across TP (column) axis
-            args.sampling_dp = mesh_device.shape[0]
-            args.is_galaxy = mesh_device.shape[0] > 1
+            # gather across the TP axis (the columns unless GEMMA4_TP_AXIS=0); the other axis is the DP axis
+            _tp_axis = int(getattr(mesh_config, "tp_axis", 1)) if mesh_config is not None else 1
+            args.sampling_all_gather_axis = _tp_axis
+            args.sampling_dp = mesh_device.shape[1 - _tp_axis]
+            args.is_galaxy = mesh_device.shape[1 - _tp_axis] > 1
         args.num_devices = mesh_device.get_num_devices()
         args.model_config = {}
         args.use_topk_logprobs = False
@@ -1356,9 +1361,12 @@ class Gemma4Model:
 
         if self.final_logit_softcapping and self.final_logit_softcapping > 0:
             cap = self.final_logit_softcapping
-            logits = ttnn.mul(logits, 1.0 / cap)
-            logits = ttnn.tanh(logits)
-            logits = ttnn.mul(logits, cap)
+            if os.environ.get("GEMMA4_SOFTCAP_FUSED", "0") == "1":
+                logits = ttnn.softcap(logits, cap)  # cap * tanh(logits / cap) as one program
+            else:
+                logits = ttnn.mul(logits, 1.0 / cap)
+                logits = ttnn.tanh(logits)
+                logits = ttnn.mul(logits, cap)
         if is_decode:
             signpost(header=LM_HEAD_SIGNPOST)
 

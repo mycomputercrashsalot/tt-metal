@@ -14,7 +14,9 @@ Enabled with GEMMA4_MOE_DISPATCH_PREFILL=1 (see experts/__init__.py). The direct
 run along mesh axis 0 ("cluster_axis must be 0 ... not tested"); a single-row mesh (the 4-chip / 8-chip entries)
 dispatches along its columns, which needs GEMMA4_MOE_DISPATCH_RING=1: the hop-forwarding ``dispatch_fabric2d`` /
 ``combine_fabric2d`` pair on a wrap-wired axis (open the mesh with FABRIC_1D_RING; the model's own collectives can
-stay Linear). The experts run on the model-local GeGLU op
+stay Linear). The 4-chip line can instead open as the column mesh MeshShape(4, 1) with GEMMA4_TP_AXIS=0 (TP over
+the rows): the rows are then the one dispatch group (32 experts per chip, direct ops, FABRIC_1D) and no ring is
+needed. The experts run on the model-local GeGLU op
 (custom_ops/geglu_routed_expert, a ttnn.generic_op) over TtRoutedExpert's weights, buffers and index table;
 TtRoutedExpert itself only loads and caches the weights, its fused op never runs here.
 """

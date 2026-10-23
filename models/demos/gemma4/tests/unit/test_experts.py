@@ -21,6 +21,7 @@ from ...tests.test_factory import (
     TestFactory,
     compare_tensors,
     get_pcc_threshold,
+    mesh_tp_and_axis,
     parametrize_batch_seq,
     parametrize_mesh_with_fabric,
     skip_if_not_moe,
@@ -34,12 +35,13 @@ def test_experts(batch_size, seq_len, mesh_device, reset_seeds, request):
     run_experts(batch_size, seq_len, mesh_device, request)
 
 
-# the direct dispatch/combine ops run along mesh axis 0 only: single-row meshes take test_experts_dispatch_ring
+# the direct dispatch/combine ops run along mesh axis 0 only: single-row meshes take test_experts_dispatch_ring; the
+# 4-chip line runs them as the (4,1) column mesh (GEMMA4_TP_AXIS=0: TP over the rows = the dispatch group)
 @skip_if_not_moe
 @pytest.mark.skipif(
     not is_blackhole(), reason="token-dispatch prefill runs the Blackhole-only unified_routed_expert_ffn"
 )
-@parametrize_mesh_with_fabric(mesh_shapes=[(2, 4), (8, 4)])
+@parametrize_mesh_with_fabric(mesh_shapes=[(4, 1), (2, 4), (8, 4)])
 @pytest.mark.parametrize("seq_len", [128, 1024, 4096 + 128], ids=["prefill_128", "prefill_1024", "prefill_4224"])
 def test_experts_dispatch(seq_len, mesh_device, reset_seeds, request, monkeypatch):
     """Token-dispatch prefill (DeepSeek dispatch/combine + fused GeGLU experts) vs the HF reference; 4224 tokens
@@ -96,9 +98,10 @@ def run_experts(batch_size, seq_len, mesh_device, request, pcc_threshold=None):
 
     is_mesh = hasattr(mesh_device, "shape") and mesh_device.get_num_devices() > 1
     # (8,4): the Galaxy one-instance orientation (TP on the size-8 axis 0, fractured dense weights,
-    # EP over the 4 columns); every other 2-D mesh: TP over axis 1, EP over axis 0.
+    # EP over the 4 columns); every other 2-D mesh: TP over axis 1, EP over axis 0 -- or, with
+    # GEMMA4_TP_AXIS=0, TP over axis 0 and EP over axis 1 (the 4-chip line as a (4,1) column mesh).
     galaxy = is_mesh and tuple(mesh_device.shape) == (8, 4)
-    tp = (mesh_device.shape[0] if galaxy else mesh_device.shape[1]) if hasattr(mesh_device, "shape") else 1
+    tp, tp_axis = mesh_tp_and_axis(mesh_device)
 
     if tp > 1:
         # Multi-device: real model dims, TP-sharded, HF reference layer for weights
@@ -143,8 +146,11 @@ def run_experts(batch_size, seq_len, mesh_device, request, pcc_threshold=None):
             weight_fracture=True,
         )
     else:
-        ep = mesh_device.shape[0] if hasattr(mesh_device, "shape") and mesh_device.shape[0] > 1 else 1
-        mesh_config = MeshConfig(mesh_device.shape, decode=ModeConfig(tp=tp, ep=ep), prefill=ModeConfig(tp=tp, ep=ep))
+        ep_axis = 1 - tp_axis
+        ep = mesh_device.shape[ep_axis] if hasattr(mesh_device, "shape") and mesh_device.shape[ep_axis] > 1 else 1
+        mesh_config = MeshConfig(
+            mesh_device.shape, decode=ModeConfig(tp=tp, ep=ep), prefill=ModeConfig(tp=tp, ep=ep), tp_axis=tp_axis
+        )
     ccl_manager = CCLManager(mesh_device, num_links=1) if tp > 1 else None
 
     tt_experts = Gemma4Experts(

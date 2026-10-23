@@ -421,6 +421,24 @@ def _is_device_discovery_failure(exc):
 GEMMA4_TEST_L1_SMALL_SIZE = 32768
 
 
+def mesh_tp_and_axis(mesh_device):
+    """``(tp, tp_axis)`` of the dense TP group the unit tests build for ``mesh_device``.
+
+    (8,4) is the Galaxy one-instance orientation (TP on the size-8 axis 0, see ``test_experts``); every other mesh
+    takes ``GEMMA4_TP_AXIS`` (default 1, the columns), so ``GEMMA4_TP_AXIS=0 GEMMA4_TEST_MESH_SHAPES=4x1`` runs the
+    4-chip line as a column mesh with TP over the rows (the token-dispatch prefill orientation).
+    """
+    from models.demos.gemma4.tt.ccl import mesh_tp_axis
+
+    if not hasattr(mesh_device, "shape"):
+        return 1, 1
+    shape = tuple(int(d) for d in mesh_device.shape)
+    if shape == (8, 4):
+        return 8, 0
+    axis = mesh_tp_axis()
+    return shape[axis], axis
+
+
 def parametrize_mesh_with_fabric(mesh_shapes=None, device_params_extra=None):
     """Universal mesh parametrization with FABRIC_1D.
 
@@ -472,7 +490,13 @@ def parametrize_mesh_with_fabric(mesh_shapes=None, device_params_extra=None):
 
         return decorator
 
-    if mesh_shapes is None:
+    env_shapes = os.getenv("GEMMA4_TEST_MESH_SHAPES", "").strip()
+    if env_shapes:
+        # Harness override: run the selected tests on these shapes instead of the decorator's list, e.g.
+        # ``GEMMA4_TEST_MESH_SHAPES=4x1`` (with ``GEMMA4_TP_AXIS=0``) to run the 4-chip line as a column mesh.
+        mesh_shapes = [tuple(int(d) for d in tok.lower().split("x")) for tok in env_shapes.split(",") if tok]
+        mesh_shapes = [s for s in mesh_shapes if s[0] * s[1] <= num_devices]
+    elif mesh_shapes is None:
         all_shapes = [(1, 1), (1, 2), (1, 4), (1, 8), (1, 32)]
         mesh_shapes = [s for s in all_shapes if s[0] * s[1] <= num_devices]
     else:
